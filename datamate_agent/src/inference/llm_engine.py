@@ -1,7 +1,8 @@
 """
 Offline LLM Engine for DataMate Challenge.
 Wraps vLLM for high-throughput batch generation with offline weights,
-optional LoRA adapter loading, fp8/4-bit quantization, and CPU fallback.
+with seamless fallback to Hugging Face Transformers GPU (4-bit/bfloat16)
+and CPU mock mode.
 """
 
 import logging
@@ -10,16 +11,19 @@ from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
+# Check if PyTorch and CUDA are available
+import torch
+HAS_CUDA = torch.cuda.is_available()
+
 # Check if vLLM is available
 HAS_VLLM = False
-try:
-    import torch
-    if torch.cuda.is_available():
+if HAS_CUDA:
+    try:
         from vllm import LLM, SamplingParams
         from vllm.lora.request import LoRARequest
         HAS_VLLM = True
-except Exception:
-    HAS_VLLM = False
+    except Exception:
+        HAS_VLLM = False
 
 
 class LLMEngine:
@@ -40,8 +44,12 @@ class LLMEngine:
         self.llm = None
         self.lora_request = None
         self.is_offline_vllm = False
+        self.is_hf_gpu = False
+        self.hf_model = None
+        self.hf_tokenizer = None
 
-        if HAS_VLLM and os.path.exists(model_name_or_path) or (HAS_VLLM and "/" in model_name_or_path):
+        # 1. Try vLLM if available
+        if HAS_VLLM and (os.path.exists(model_name_or_path) or "/" in model_name_or_path):
             try:
                 logger.info(f"Initializing vLLM engine with model: {model_name_or_path}")
                 enable_lora = bool(adapter_path and os.path.exists(adapter_path))
@@ -66,11 +74,43 @@ class LLMEngine:
                     self.lora_request = LoRARequest("datamate_adapter", 1, adapter_path)
                     logger.info(f"Loaded LoRA adapter from: {adapter_path}")
             except Exception as e:
-                logger.warning(f"Could not initialize vLLM (falling back to mock/CPU mode): {e}")
+                logger.warning(f"Could not initialize vLLM: {e}")
                 self.llm = None
                 self.is_offline_vllm = False
-        else:
-            logger.info("Running in CPU / Fallback Mock Mode (no GPU / vLLM available).")
+
+        # 2. If vLLM is not active but CUDA is available, use HuggingFace Transformers
+        if not self.is_offline_vllm and HAS_CUDA and (os.path.exists(model_name_or_path) or "/" in model_name_or_path):
+            try:
+                from transformers import AutoModelForCausalLM, AutoTokenizer
+                logger.info(f"Loading Hugging Face model on GPU: {model_name_or_path}")
+                self.hf_tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+                try:
+                    self.hf_model = AutoModelForCausalLM.from_pretrained(
+                        model_name_or_path,
+                        load_in_4bit=True,
+                        device_map="auto",
+                        trust_remote_code=trust_remote_code,
+                    )
+                except Exception:
+                    self.hf_model = AutoModelForCausalLM.from_pretrained(
+                        model_name_or_path,
+                        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                        device_map="auto",
+                        trust_remote_code=trust_remote_code,
+                    )
+                
+                if adapter_path and os.path.exists(adapter_path):
+                    from peft import PeftModel
+                    self.hf_model = PeftModel.from_pretrained(self.hf_model, adapter_path)
+                    logger.info(f"Loaded PEFT adapter into HuggingFace model from: {adapter_path}")
+                
+                self.is_hf_gpu = True
+            except Exception as e:
+                logger.warning(f"Could not load Hugging Face model on GPU: {e}")
+                self.is_hf_gpu = False
+
+        if not self.is_offline_vllm and not self.is_hf_gpu:
+            logger.info("Running in Fallback Mock Mode (no GPU model loaded).")
 
     def generate_batch(
         self,
@@ -98,10 +138,28 @@ class LLMEngine:
             )
             return [[output.outputs[0].text for output in outputs]]
 
-        # CPU / Fallback Mode (useful for offline local testing and mock validation)
+        if self.is_hf_gpu and self.hf_model is not None and self.hf_tokenizer is not None:
+            results = []
+            for prompt in prompts:
+                inputs = self.hf_tokenizer(prompt, return_tensors="pt").to(self.hf_model.device)
+                do_sample = temperature > 0.0
+                gen_kwargs: Dict[str, Any] = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": do_sample,
+                    "pad_token_id": self.hf_tokenizer.eos_token_id,
+                }
+                if do_sample:
+                    gen_kwargs["temperature"] = temperature
+                    gen_kwargs["top_p"] = top_p
+                with torch.no_grad():
+                    gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
+                out_text = self.hf_tokenizer.decode(gen_tokens[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                results.append([out_text])
+            return results
+
+        # CPU / Fallback Mock Mode
         fallback_results = []
         for p in prompts:
-            # Deterministic heuristic answer for testing
             mock_resp = (
                 "Notes:\n"
                 "- Query sales for valid orders.\n"
@@ -139,14 +197,32 @@ class LLMEngine:
             )
             return [out.text for out in outputs[0].outputs]
 
-        # Fallback for CPU / mock mode
-        results = []
-        for i in range(n):
-            results.append(
-                f"Notes:\n- Sample {i}: calculate sales revenue.\n"
-                f"TYPE: number\n"
-                f"```sql\n"
-                f"SELECT COALESCE(ROUND(SUM(line_amount), 0), 0) AS answer FROM v_sales WHERE is_valid_sales = TRUE;\n"
-                f"```"
-            )
-        return results
+        if self.is_hf_gpu and self.hf_model is not None and self.hf_tokenizer is not None:
+            results = []
+            inputs = self.hf_tokenizer(prompt, return_tensors="pt").to(self.hf_model.device)
+            do_sample = temperature > 0.0
+            for _ in range(n):
+                gen_kwargs: Dict[str, Any] = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": do_sample,
+                    "pad_token_id": self.hf_tokenizer.eos_token_id,
+                }
+                if do_sample:
+                    gen_kwargs["temperature"] = temperature
+                    gen_kwargs["top_p"] = top_p
+                with torch.no_grad():
+                    gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
+                out_text = self.hf_tokenizer.decode(gen_tokens[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                results.append(out_text)
+            return results
+
+        # Fallback Mock Mode
+        mock_resp = (
+            "Notes:\n"
+            "- Calculation for total amount.\n"
+            "TYPE: number\n"
+            "```sql\n"
+            "SELECT COALESCE(ROUND(SUM(line_amount), 0), 0) AS answer FROM v_sales WHERE is_valid_sales = TRUE;\n"
+            "```"
+        )
+        return [mock_resp] * n
