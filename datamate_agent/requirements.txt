@@ -1,0 +1,22 @@
+# DataMate Agent Dependencies
+duckdb>=1.0.0
+openpyxl>=3.1.2
+pandas>=2.0.0
+numpy>=1.24.0
+pyyaml>=6.0
+pydantic>=2.0.0
+tqdm>=4.66.0
+python-dateutil>=2.8.2
+
+# LLM Inference (vLLM & Hugging Face)
+vllm>=0.6.0; sys_platform != 'win32'
+torch>=2.2.0
+transformers>=4.40.0
+accelerate>=0.28.0
+safetensors>=0.4.0
+
+# QLoRA Fine-tuning (Colab GPU)
+peft>=0.10.0
+bitsandbytes>=0.43.0; sys_platform != 'win32'
+datasets>=2.18.0
+triton>=2.1.0; sys_platform != 'win32'

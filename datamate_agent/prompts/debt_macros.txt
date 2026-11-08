@@ -1,0 +1,72 @@
+-- DuckDB Macro Templates for Vietnamese Small-Business Debt Tracking (Công Nợ)
+-- Follows Section 4 of DataMate Rulebook
+
+-------------------------------------------------------------------
+-- 1. debt_at(target_date)
+-- Calculates remaining unpaid balance for all eligible orders up to target_date.
+-- Includes un-cancelled orders (including returned orders if unpaid).
+-- Excludes COD and E-commerce orders.
+-------------------------------------------------------------------
+CREATE OR REPLACE MACRO debt_at(target_date) AS TABLE
+SELECT 
+    o.order_id,
+    o.customer_id,
+    o.customer_name,
+    o.order_date,
+    DATEDIFF('day', o.order_date, CAST(target_date AS DATE)) AS debt_age_days,
+    o.order_total,
+    COALESCE(SUM(p.paid_amount), 0) AS total_paid_to_date,
+    (o.order_total - COALESCE(SUM(p.paid_amount), 0)) AS remaining_debt
+FROM v_orders o
+LEFT JOIN v_payments p 
+    ON o.order_id = p.order_id 
+   AND CAST(p.payment_date AS DATE) <= CAST(target_date AS DATE)
+WHERE o.is_cancelled = FALSE
+  AND LOWER(COALESCE(o.payment_method, '')) NOT IN ('cod', 'sàn tmđt', 'shopee', 'lazada', 'tiktok')
+  AND CAST(o.order_date AS DATE) <= CAST(target_date AS DATE)
+GROUP BY o.order_id, o.customer_id, o.customer_name, o.order_date, o.order_total
+HAVING (o.order_total - COALESCE(SUM(p.paid_amount), 0)) > 0;
+
+-------------------------------------------------------------------
+-- 2. debt_new(start_date, end_date)
+-- Calculates newly incurred debt for credit orders placed in [start_date, end_date]
+-- Portion of order total NOT paid on the order date.
+-------------------------------------------------------------------
+CREATE OR REPLACE MACRO debt_new(start_date, end_date) AS TABLE
+SELECT 
+    o.order_id,
+    o.customer_id,
+    o.customer_name,
+    o.order_date,
+    (o.order_total - COALESCE(same_day.same_day_paid, 0)) AS new_debt_amount
+FROM v_orders o
+LEFT JOIN (
+    SELECT order_id, SUM(paid_amount) AS same_day_paid
+    FROM v_payments
+    WHERE payment_date = order_date
+    GROUP BY order_id
+) same_day ON o.order_id = same_day.order_id
+WHERE o.is_cancelled = FALSE
+  AND LOWER(COALESCE(o.payment_method, '')) IN ('ghi nợ', 'nợ', 'công nợ')
+  AND CAST(o.order_date AS DATE) BETWEEN CAST(start_date AS DATE) AND CAST(end_date AS DATE)
+  AND (o.order_total - COALESCE(same_day.same_day_paid, 0)) > 0;
+
+-------------------------------------------------------------------
+-- 3. debt_repaid(start_date, end_date)
+-- Calculates debt repayments collected between start_date and end_date
+-- for credit orders where payment was made AFTER the order date.
+-------------------------------------------------------------------
+CREATE OR REPLACE MACRO debt_repaid(start_date, end_date) AS TABLE
+SELECT 
+    p.payment_id,
+    p.order_id,
+    o.customer_id,
+    o.customer_name,
+    p.payment_date,
+    p.paid_amount
+FROM v_payments p
+JOIN v_orders o ON p.order_id = o.order_id
+WHERE o.is_cancelled = FALSE
+  AND LOWER(COALESCE(o.payment_method, '')) IN ('ghi nợ', 'nợ', 'công nợ')
+  AND CAST(p.payment_date AS DATE) > CAST(o.order_date AS DATE)
+  AND CAST(p.payment_date AS DATE) BETWEEN CAST(start_date AS DATE) AND CAST(end_date AS DATE);

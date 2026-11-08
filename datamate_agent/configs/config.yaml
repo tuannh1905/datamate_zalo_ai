@@ -1,0 +1,85 @@
+# DataMate Agent Configuration
+# Offline Vietnamese Tabular QA Agent
+
+system:
+  seed: 42
+  debug: false
+  log_level: "INFO"
+
+paths:
+  # Competition input/output directories
+  data_dir: "/data"
+  rulebook_path: "/data/rulebook.md"
+  calendar_path: "/data/calendar.csv"
+  questions_path: "/data/questions.jsonl"
+  submission_path: "/result/submission.jsonl"
+  log_dir: "/result/logs"
+  
+  # Local weights & cache paths
+  model_dir: "./weights/base_model"
+  adapter_dir: "./weights/adapters/v3"
+  training_data_dir: "./data_cache"
+
+model:
+  base_model_name_or_path: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  adapter_path: null  # Set to adapter directory if loaded
+  load_in_4bit: false
+  load_in_8bit: false
+  dtype: "bfloat16"
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.90
+  max_model_len: 16384
+  trust_remote_code: true
+
+inference:
+  # Sampling parameters for plain samples (k=8)
+  num_samples_k: 8
+  temperature: 0.1
+  top_p: 0.95
+  max_new_tokens: 1024
+  
+  # Thinking / Deep reasoning samples (+4 on low agreement)
+  num_thinking_samples: 4
+  thinking_temperature: 0.6
+  thinking_max_new_tokens: 2048
+  
+  # Voting & Abstain policy
+  agreement_threshold_tau: 0.5  # Need >= 50% majority agreement
+  abstain_on_failure: true
+
+execution:
+  sql_timeout_seconds: 10.0
+  max_repair_turns: 2
+  max_rows_output: 100
+  memory_limit: "4GB"
+  threads: 4
+
+view_builder:
+  sample_k: 8
+  min_agreement_ratio: 0.25  # >= k / 4 (2 out of 8)
+  max_repair_turns: 2
+
+debt_macros:
+  enable_debt_macros: true
+  plausibility_check: true
+
+training:
+  student_model_name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  learning_rate: 2.0e-4
+  num_train_epochs: 1
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  mask_prompt_loss: true

@@ -1,0 +1,48 @@
+===================================================================
+1. BUSINESS OVERVIEW (README)
+===================================================================
+Business ID: {business_id}
+{business_readme}
+
+===================================================================
+2. DATABASE SCHEMA & SAMPLE DATA
+===================================================================
+The DuckDB database contains the following tables:
+{schema_and_samples}
+
+===================================================================
+3. CANONICAL VIEWS & MACROS (IF CONSTRUCTED)
+===================================================================
+{canonical_views_section}
+
+===================================================================
+4. DATE ANCHORS & TIME WINDOW RESOLUTION
+===================================================================
+- Today (as_of_date): {as_of_date}
+- Target Date Context:
+{date_anchors_explanation}
+
+===================================================================
+5. RULEBOOK CONSTRAINTS & HINTS
+===================================================================
+- Revenue: Exclude cancelled ('huỷ') and returned ('trả hàng') orders. Sum of line item amount (after line discount, BEFORE order-level voucher). Do NOT deduct order voucher, do NOT include VAT/delivery fee.
+- Dates: Orders belong to a period by `order_date` (ngày đặt), not delivery/payment date.
+- Ranking: Highest/lowest ranked by metric DESC. Ties MUST be broken by product_id/item_code ASC.
+- Rounding: VND amounts round to nearest integer. Percentages round to 2 decimals.
+- Unanswerable: If the required columns/data (e.g. COGS/cost for profit) do not exist, return unanswerable.
+
+===================================================================
+6. FEW-SHOT EXAMPLES (SIMILAR QUESTIONS)
+===================================================================
+{few_shot_examples}
+
+===================================================================
+7. CURRENT QUESTION
+===================================================================
+Question: "{question}"
+As-of Date: {as_of_date}
+
+Please write your reasoning in Notes, then output the target TYPE and the DuckDB SQL query.
+Assistant:
+Notes:
+- 

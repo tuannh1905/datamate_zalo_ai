@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Model Weights & LoRA Adapters
+weights/
+*.pt
+*.bin
+*.safetensors
+*.pth
+
+# Pipeline Training Caches
+data_cache/
+
+# Execution Outputs & Logs
+result/
+logs/
+*.log
+
+# Environment & IDE
+.env
+.venv
+env/
+venv/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,55 @@
+You are an expert Data Engineer tasked with creating canonical SQL views in DuckDB for messy Vietnamese small-business schemas.
+
+===================================================================
+OBJECTIVE
+===================================================================
+Given the raw table schemas, column names, sample rows, and business README for a shop, create two unified canonical views:
+1. `v_orders`: Grain is 1 row per order / invoice.
+2. `v_sales`: Grain is 1 row per product item in an order.
+
+===================================================================
+CANONICAL COLUMN SPECIFICATIONS
+===================================================================
+
+`v_orders`:
+- `order_id`: unique order code/identifier (VARCHAR)
+- `order_date`: date of the order as DATE (YYYY-MM-DD)
+- `order_time`: time of order creation (VARCHAR or TIME, if available, else NULL)
+- `status`: normalized status: 'hoàn thành', 'huỷ', 'trả hàng', 'đang giao' (VARCHAR)
+- `is_cancelled`: BOOLEAN (TRUE if cancelled/huỷ)
+- `is_returned`: BOOLEAN (TRUE if returned/trả hàng)
+- `is_valid_sales`: BOOLEAN (TRUE if NOT is_cancelled AND NOT is_returned)
+- `customer_id`: customer code (VARCHAR, NULL if Khách lẻ)
+- `customer_name`: customer name (VARCHAR)
+- `payment_method`: payment type (e.g. 'Tiền mặt', 'Chuyển khoản', 'Ghi nợ', 'COD')
+- `employee_name`: salesperson name (if available, else NULL)
+- `order_total`: total order amount customers must pay (NUMERIC)
+
+`v_sales`:
+- `order_id`: order identifier (VARCHAR)
+- `order_date`: date of order as DATE (YYYY-MM-DD)
+- `status`: normalized order status (VARCHAR)
+- `is_valid_sales`: BOOLEAN (TRUE if NOT cancelled AND NOT returned)
+- `customer_id`: customer code (VARCHAR, NULL if Khách lẻ)
+- `customer_name`: customer name (VARCHAR)
+- `product_id`: product code (VARCHAR, if available, else product_name)
+- `product_name`: normalized product name (VARCHAR)
+- `category_name`: product category/group (VARCHAR, if available, else NULL)
+- `unit_name`: sold unit name (e.g. lon, chai, lốc, thùng)
+- `quantity_base`: quantity normalized to base unit (NUMERIC)
+- `unit_price`: unit price per base unit (NUMERIC)
+- `line_amount`: line total after line discount, before order-level vouchers (NUMERIC)
+- `cogs`: cost of goods sold for this line (NUMERIC, if available, else NULL)
+
+===================================================================
+OUTPUT FORMAT
+===================================================================
+Write only the executable DuckDB SQL block creating `v_orders` and `v_sales`:
+
+```sql
+CREATE OR REPLACE VIEW v_orders AS
+SELECT ... ;
+
+CREATE OR REPLACE VIEW v_sales AS
+SELECT ... ;
+```
