@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-scripts/download_dataset.py - Robust Dataset Downloader & Normalizer for Google Colab.
+scripts/download_dataset.py - Universal Dataset Downloader & Normalizer for Google Colab.
 
-Solves common Colab dataset issues:
-1. Google Drive rate limits and 'gdown --folder' failures.
-2. Nested folder confusion (e.g., train/train vs train).
-3. Scanning all splits (both train and public_test) across Google Drive.
-4. Auto-unzipping any .zip archives found on Google Drive.
-5. Slow Google Drive FUSE I/O by copying to fast local storage (/content/).
-6. Health check & clear status reporting for both train and public_test splits.
+Designed for running across multiple Google Colab accounts without mounting Google Drive:
+1. Direct URL / Google Drive link download (single zip or folder).
+2. Hugging Face Dataset repository snapshot download.
+3. Multi-link support (download train.zip and public_test.zip together).
+4. Auto-unzipping, folder restructuring, and dataset health check.
+5. Zero dependency on Google Drive mount: works uniformly across any email / account.
 """
 
 import argparse
@@ -18,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.request
 import zipfile
 from typing import Optional, List, Dict, Set
 
@@ -65,7 +65,6 @@ def find_files_recursive(search_dir: str, target_filename: str) -> List[str]:
 def find_zip_archives(search_dir: str) -> List[str]:
     """Finds dataset-specific zip files in search_dir (strictly filtered)."""
     zip_files = []
-    # Only match exact dataset keywords - never generic '*.zip'
     strict_patterns = ["*train*.zip", "*public*.zip", "*zalo*.zip", "*datamate*.zip"]
     for root, _, files in os.walk(search_dir):
         for f in files:
@@ -148,7 +147,7 @@ def validate_and_health_check(target_base: str):
             if split_name == "train":
                 log(f"Split directory not found: {split_dir}", "WARNING")
                 log("👉 Lưu ý: Chưa có bộ 'train'. Bạn có thể chạy eval/test trên 'public_test'. "
-                    "Nếu muốn huấn luyện (train model), hãy upload thư mục 'train' hoặc 'train.zip' lên Google Drive.", "WARNING")
+                    "Nếu muốn huấn luyện (train model), hãy tải thêm bộ 'train'.", "WARNING")
             else:
                 log(f"Split directory not found: {split_dir}", "WARNING")
             continue
@@ -186,70 +185,83 @@ def validate_and_health_check(target_base: str):
         log("Bộ dữ liệu public_test đã sẵn sàng để kiểm thử và chấm điểm!", "SUCCESS")
 
 
-def scan_and_extract_drive(drive_mount_root: str, temp_dir: str) -> List[str]:
-    """
-    Scans Google Drive for any zip files and unzips them.
-    Returns list of search candidate directories.
-    """
-    search_dirs = [drive_mount_root]
+def download_url_to_file(url: str, dest_path: str):
+    """Downloads from direct URL or Google Drive link."""
+    url = url.strip()
+    if not url:
+        return
 
-    # Look for zip archives and extract
-    zips = find_zip_archives(drive_mount_root)
-    for z in zips:
-        base_name = os.path.splitext(os.path.basename(z))[0]
-        ext_target = os.path.join(temp_dir, base_name)
-        if not os.path.exists(ext_target):
-            try:
-                extract_zip(z, ext_target)
-                search_dirs.append(ext_target)
-            except Exception as e:
-                log(f"Failed to extract zip {z}: {e}", "WARNING")
+    # 1. Google Drive link handling
+    if "drive.google.com" in url or "docs.google.com" in url:
+        try:
+            import gdown
+        except ImportError:
+            run_cmd([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "gdown"])
+            import gdown
+
+        if "/drive/folders/" in url or "/folders/" in url:
+            log(f"Downloading Google Drive folder: {url} -> {dest_path}", "STEP")
+            os.makedirs(dest_path, exist_ok=True)
+            gdown.download_folder(url=url, output=dest_path, quiet=False, remaining_ok=True)
         else:
-            search_dirs.append(ext_target)
+            log(f"Downloading Google Drive file: {url} -> {dest_path}", "STEP")
+            os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+            gdown.download(url=url, output=dest_path, quiet=False, fuzzy=True)
+        return
 
-    return search_dirs
+    # 2. Dropbox link handling
+    if "dropbox.com" in url:
+        url = url.replace("?dl=0", "?dl=1")
+        if "?dl=1" not in url:
+            url += "?dl=1"
 
-
-def download_with_gdown_folder(folder_url: str, output_dir: str):
-    """Downloads folder using gdown with retry logic."""
-    log("Attempting folder download via gdown...", "STEP")
+    # 3. Direct HTTP/HTTPS download
+    log(f"Downloading from link: {url} -> {dest_path}", "STEP")
+    os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
     try:
-        import gdown
+        # Use curl if available for speed and resumable support
+        run_cmd(["curl", "-L", "-C", "-", url, "-o", dest_path])
+    except Exception:
+        # Fallback to urllib
+        opener = urllib.request.build_opener()
+        opener.addheaders = [('User-Agent', 'Mozilla/5.0')]
+        urllib.request.install_opener(opener)
+        urllib.request.urlretrieve(url, dest_path)
+    log(f"Download completed: {dest_path}", "SUCCESS")
+
+
+def download_hf_dataset(repo_id: str, dest_dir: str, token: Optional[str] = None):
+    """Downloads dataset from Hugging Face Hub (fast, no rate-limits, multi-account friendly)."""
+    log(f"Downloading from Hugging Face Hub: {repo_id} -> {dest_dir}", "STEP")
+    try:
+        from huggingface_hub import snapshot_download
     except ImportError:
-        run_cmd([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "gdown"])
-        import gdown
+        run_cmd([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"])
+        from huggingface_hub import snapshot_download
 
-    os.makedirs(output_dir, exist_ok=True)
-    log(f"Downloading from {folder_url} -> {output_dir}")
-    try:
-        gdown.download_folder(url=folder_url, output=output_dir, quiet=False, remaining_ok=True)
-    except Exception as e:
-        log(f"gdown folder download failed: {e}", "WARNING")
-        raise
-
-
-def download_with_gdown_file(file_id_or_url: str, output_path: str):
-    """Downloads single file/zip using gdown."""
-    try:
-        import gdown
-    except ImportError:
-        run_cmd([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "gdown"])
-        import gdown
-
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    log(f"Downloading file with gdown: {file_id_or_url} -> {output_path}", "STEP")
-    gdown.download(file_id_or_url, output=output_path, quiet=False, fuzzy=True)
+    os.makedirs(dest_dir, exist_ok=True)
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        local_dir=dest_dir,
+        token=token,
+        local_dir_use_symlinks=False
+    )
+    log(f"Hugging Face dataset downloaded successfully into: {dest_dir}", "SUCCESS")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Reliable Dataset Downloader & Normalizer for Colab")
-    parser.add_argument("--mode", choices=["auto", "mount", "gdown_folder", "gdown_file", "local_zip", "check_only"],
-                        default="auto", help="Download/acquisition mode")
-    parser.add_argument("--url", default="https://drive.google.com/drive/folders/1sMB8d47li018WyG_SsXIZJ02jfL8OaLi",
-                        help="Google Drive folder or file URL")
-    parser.add_argument("--file_id", default=None, help="Google Drive File ID for zip")
+    parser = argparse.ArgumentParser(description="Universal Dataset Downloader & Normalizer for Colab (Link-based, Multi-account)")
+    parser.add_argument("--url", action="append", default=[],
+                        help="Direct download URL or Google Drive link (can specify multiple times or comma-separated)")
+    parser.add_argument("--hf_repo", default=None,
+                        help="Hugging Face Dataset repo ID (e.g. username/zalo_dataset)")
+    parser.add_argument("--hf_token", default=None,
+                        help="Hugging Face API token (if repo is private)")
+    parser.add_argument("--mode", choices=["auto", "url", "hf", "mount", "local_zip", "check_only"],
+                        default="auto", help="Download mode")
     parser.add_argument("--zip_path", default=None, help="Path to local or mounted zip file")
-    parser.add_argument("--drive_dir", default=None, help="Specific folder inside Google Drive to scan")
+    parser.add_argument("--drive_dir", default=None, help="Folder inside Google Drive (if mounted)")
     parser.add_argument("--target_base", default="/content/dataset_gdrive",
                         help="Target base directory expected by datasets.yaml")
     parser.add_argument("--temp_dir", default="/content/raw_download",
@@ -264,75 +276,92 @@ def main():
         validate_and_health_check(args.target_base)
         return
 
-    # Check mode AUTO logic
+    # Collect URLs from arguments or environment variable DATASET_URL
+    urls = []
+    if args.url:
+        for u in args.url:
+            for sub_u in u.split(","):
+                sub_u = sub_u.strip()
+                if sub_u:
+                    urls.append(sub_u)
+    elif os.environ.get("DATASET_URL"):
+        for sub_u in os.environ["DATASET_URL"].split(","):
+            sub_u = sub_u.strip()
+            if sub_u:
+                urls.append(sub_u)
+
+    # Determine mode
     if args.mode == "auto":
-        # Check if Google Drive is mounted
-        drive_root = args.drive_dir or "/content/drive/MyDrive"
-        if os.path.exists(drive_root):
-            args.mode = "mount"
+        if args.hf_repo:
+            args.mode = "hf"
+        elif urls:
+            args.mode = "url"
         elif args.zip_path and os.path.exists(args.zip_path):
             args.mode = "local_zip"
-        elif args.file_id:
-            args.mode = "gdown_file"
+        elif args.drive_dir and os.path.exists(args.drive_dir):
+            args.mode = "mount"
+        elif os.path.exists("/content/drive/MyDrive/zalo_ai_data"):
+            args.mode = "mount"
         else:
-            args.mode = "gdown_folder"
+            # Check if dataset is already valid in target_base
+            train_q = os.path.join(args.target_base, "train", "train", "questions.jsonl")
+            if os.path.exists(train_q):
+                args.mode = "check_only"
+            else:
+                args.mode = "url"
 
-    log(f"Running in mode: {args.mode}", "STEP")
+    log(f"Running downloader in mode: [{args.mode}]", "STEP")
 
-    if args.mode == "mount":
-        drive_root = args.drive_dir
-        if not drive_root:
-            # Check for dedicated competition folders first
-            for cand in ["/content/drive/MyDrive/zalo_ai_data", "/content/drive/MyDrive/ZaloAI_DataMate", "/content/drive/MyDrive/DataMate"]:
-                if os.path.exists(cand):
-                    drive_root = cand
-                    log(f"Found dedicated dataset folder in Drive: {drive_root}", "SUCCESS")
-                    break
-            if not drive_root:
-                drive_root = "/content/drive/MyDrive"
+    search_dirs = [args.temp_dir]
 
-        # Check if drive_root already contains questions.jsonl
-        existing_q = find_files_recursive(drive_root, "questions.jsonl")
-        search_dirs = [drive_root]
+    if args.mode == "hf":
+        if not args.hf_repo:
+            raise ValueError("Please provide --hf_repo (e.g. --hf_repo username/zalo_dataset)")
+        download_hf_dataset(args.hf_repo, args.temp_dir, args.hf_token)
+        search_dirs.append(args.temp_dir)
 
-        # Only search for and extract zips if questions.jsonl files are missing
-        if not existing_q:
-            log("No questions.jsonl directly found, checking for dataset zip archives...", "INFO")
-            search_dirs = scan_and_extract_drive(drive_root, args.temp_dir)
+    elif args.mode == "url":
+        if not urls:
+            # Prompt user clearly
+            print("\n" + "=" * 68)
+            print("💡 BẠN CHƯA CUNG CẤP LINK TẢI DATASET!")
+            print("Để chạy trên nhiều tài khoản Google Colab không cần mount Drive:")
+            print("👉 Cách 1: Truyền link trực tiếp vào lệnh:")
+            print("   !python scripts/download_dataset.py --url \"<LINK_FILE_ZIP_HOAC_DRIVE>\"")
+            print("👉 Cách 2: Nếu có 2 file train.zip và public_test.zip riêng:")
+            print("   !python scripts/download_dataset.py --url \"<LINK_TRAIN>\" --url \"<LINK_PUBLIC>\"")
+            print("👉 Cách 3: Hoặc dùng Hugging Face dataset:")
+            print("   !python scripts/download_dataset.py --hf_repo \"username/zalo_data\"")
+            print("=" * 68 + "\n")
+            raise ValueError("Missing dataset URL. Please pass --url \"<link>\"")
 
-        auto_restructure_dataset(search_dirs, args.target_base)
+        for idx, u in enumerate(urls):
+            # Check if URL is a zip archive
+            is_zip = any(u.lower().endswith(ext) for ext in [".zip", ".tar", ".gz"]) or ("drive.google.com" in u and "/folders/" not in u)
+            if is_zip:
+                dest_file = os.path.join(args.temp_dir, f"dataset_part_{idx}.zip")
+                download_url_to_file(u, dest_file)
+                extract_zip(dest_file, os.path.join(args.temp_dir, f"part_{idx}"))
+                search_dirs.append(os.path.join(args.temp_dir, f"part_{idx}"))
+            else:
+                folder_dest = os.path.join(args.temp_dir, f"folder_part_{idx}")
+                download_url_to_file(u, folder_dest)
+                search_dirs.append(folder_dest)
 
     elif args.mode == "local_zip":
         if not args.zip_path or not os.path.exists(args.zip_path):
             raise FileNotFoundError(f"Zip file not found: {args.zip_path}")
         extract_zip(args.zip_path, args.temp_dir)
-        auto_restructure_dataset([args.temp_dir], args.target_base)
+        search_dirs.append(args.temp_dir)
 
-    elif args.mode == "gdown_file":
-        zip_dest = os.path.join(args.temp_dir, "dataset.zip")
-        download_with_gdown_file(args.file_id or args.url, zip_dest)
-        extract_zip(zip_dest, args.temp_dir)
-        auto_restructure_dataset([args.temp_dir], args.target_base)
+    elif args.mode == "mount":
+        drive_root = args.drive_dir or "/content/drive/MyDrive/zalo_ai_data"
+        if not os.path.exists(drive_root):
+            drive_root = "/content/drive/MyDrive"
+        search_dirs.append(drive_root)
 
-    elif args.mode == "gdown_folder":
-        try:
-            download_with_gdown_folder(args.url, args.temp_dir)
-            auto_restructure_dataset([args.temp_dir], args.target_base)
-        except Exception as e:
-            log(f"Failed to download folder automatically: {e}", "ERROR")
-            print("\n" + "=" * 65)
-            print("🚨 KHẮC PHỤC LỖI TẢI DATASET GOOGLE DRIVE TRÊN COLAB:")
-            print("Google Drive thường xuyên chặn / giới hạn tốc độ khi tải cả thư mục.")
-            print("👉 CÁCH GIẢI QUYẾT TỐT NHẤT (100% THÀNH CÔNG):")
-            print("  1. Upload file 'train.zip' hoặc folder 'train' vào Google Drive.")
-            print("  2. Trong Colab, chạy:")
-            print("       from google.colab import drive")
-            print("       drive.mount('/content/drive')")
-            print("       !python scripts/download_dataset.py --mode auto")
-            print("=" * 65 + "\n")
-            raise
-
-    # Final health check
+    # Restructure & Validate
+    auto_restructure_dataset(search_dirs, args.target_base)
     validate_and_health_check(args.target_base)
 
 
