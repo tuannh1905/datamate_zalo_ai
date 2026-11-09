@@ -269,8 +269,8 @@ def main():
                         default="auto", help="Download mode")
     parser.add_argument("--zip_path", default=None, help="Path to local or mounted zip file")
     parser.add_argument("--drive_dir", default=None, help="Folder inside Google Drive (if mounted)")
-    parser.add_argument("--target_base", default="/content/dataset_gdrive",
-                        help="Target base directory expected by datasets.yaml")
+    parser.add_argument("--target_base", "--output_dir", dest="target_base", default="/content/dataset_gdrive",
+                        help="Target base directory expected by datasets.yaml (alias: --output_dir)")
     parser.add_argument("--temp_dir", default="/content/raw_download",
                         help="Temporary directory for raw downloads/extractions")
 
