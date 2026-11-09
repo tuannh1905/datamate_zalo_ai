@@ -114,11 +114,6 @@ GROUP BY ten_san_pham, ma_san_pham
 ORDER BY SUM(so_luong) DESC, ma_san_pham ASC
 LIMIT 3;
 ```
-  AND is_valid_sales = TRUE
-GROUP BY product_id, product_name
-ORDER BY SUM(quantity_base) DESC, product_id ASC
-LIMIT 3;
-```
 
 Example 4 (Câu không trả lời được - unanswerable):
 Question: "lợi nhuận ròng của cửa hàng trong tháng 5/2026 là bao nhiêu?"
@@ -205,6 +200,7 @@ class PromptBuilder:
         ctx: BusinessContext,
         canonical_sales_sql: Optional[str] = None,
         canonical_orders_sql: Optional[str] = None,
+        canonical_purchases_sql: Optional[str] = None,
         has_debt_macros: bool = False,
     ) -> str:
         """
@@ -226,6 +222,10 @@ class PromptBuilder:
             views_section.append("Canonical Views Available:")
             views_section.append("`v_sales`: Standardized order item sales (order_id, order_date, status, is_valid_sales, customer_id, customer_name, product_id, product_name, unit_name, quantity_base, unit_price, line_amount)")
             views_section.append("`v_orders`: Standardized order headers (order_id, order_date, status, is_cancelled, is_returned, is_valid_sales, customer_id, customer_name, payment_method, order_total)")
+        if canonical_purchases_sql:
+            if not views_section:
+                views_section.append("Canonical Views Available:")
+            views_section.append("`v_purchases`: Standardized purchase items (purchase_id, purchase_date, status, is_valid_purchase, supplier_id, supplier_name, product_id, product_name, unit_name, quantity_base, unit_price, line_amount)")
         if has_debt_macros:
             views_section.append("Debt Macros Available:")
             views_section.append("- `debt_at('YYYY-MM-DD')`: Table macro of remaining debts at given date")
@@ -258,6 +258,7 @@ class PromptBuilder:
         ctx: BusinessContext,
         canonical_sales_sql: Optional[str] = None,
         canonical_orders_sql: Optional[str] = None,
+        canonical_purchases_sql: Optional[str] = None,
         has_debt_macros: bool = False,
         runtime_rulebook_path: Optional[str] = None,
     ) -> List[Dict[str, str]]:
@@ -271,6 +272,7 @@ class PromptBuilder:
             ctx=ctx,
             canonical_sales_sql=canonical_sales_sql,
             canonical_orders_sql=canonical_orders_sql,
+            canonical_purchases_sql=canonical_purchases_sql,
             has_debt_macros=has_debt_macros,
         )
 

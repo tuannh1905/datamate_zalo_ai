@@ -55,6 +55,49 @@ class BusinessContext:
                 sample_str = ""
 
             lines.append(f"Table `{tbl}`:\n" + "\n".join(col_desc) + f"\n{sample_str}\n")
+
+        # Auto-detect table relationships & join hints
+        rel_hints = []
+        tbl_cols = {t: [c["name"].lower() for c in self.schemas.get(t, [])] for t in self.table_names}
+        tbl_orig_cols = {t: {c["name"].lower(): c["name"] for c in self.schemas.get(t, [])} for t in self.table_names}
+
+        JOIN_ID_PATTERNS = [
+            "ma_hoa_don", "ma_don", "ma_don_hang", "so_hd", "id_don_hang", "so_ct",
+            "ma_nhap_hang", "ma_phieu_nhap", "ma_phieu", "so_phieu",
+            "ma_hang", "ma_sp", "ma_khach", "ma_ncc"
+        ]
+        DATE_COL_NAMES = ["thoi_gian", "thoi_gian_tao", "ngay_ban", "ngay_tao", "ngay_hd", "ngay_nhap", "ngay_lap", "ngay", "date"]
+
+        for i, t1 in enumerate(self.table_names):
+            for j, t2 in enumerate(self.table_names):
+                if i >= j:
+                    continue
+                c1_set = set(tbl_cols[t1])
+                c2_set = set(tbl_cols[t2])
+                common = c1_set.intersection(c2_set)
+
+                matching_keys = [k for k in common if any(p in k for p in JOIN_ID_PATTERNS) or k.startswith("ma_") or k.endswith("_id")]
+                if matching_keys:
+                    best_key = matching_keys[0]
+                    t1_date = [c for c in tbl_cols[t1] if any(d in c for d in DATE_COL_NAMES)]
+                    t2_date = [c for c in tbl_cols[t2] if any(d in c for d in DATE_COL_NAMES)]
+
+                    orig_k1 = tbl_orig_cols[t1].get(best_key, best_key)
+                    orig_k2 = tbl_orig_cols[t2].get(best_key, best_key)
+
+                    date_note = ""
+                    if t1_date and not t2_date:
+                        orig_d = tbl_orig_cols[t1].get(t1_date[0], t1_date[0])
+                        date_note = f" (Note: Date '{orig_d}' is in `{t1}`)"
+                    elif t2_date and not t1_date:
+                        orig_d = tbl_orig_cols[t2].get(t2_date[0], t2_date[0])
+                        date_note = f" (Note: Date '{orig_d}' is in `{t2}`)"
+
+                    rel_hints.append(f"- Join `{t1}` and `{t2}` ON `{t1}.{orig_k1} = {t2}.{orig_k2}`{date_note}")
+
+        if rel_hints:
+            lines.append("Table Relationships & Join Hints:\n" + "\n".join(rel_hints) + "\n")
+
         return "\n".join(lines)
 
 

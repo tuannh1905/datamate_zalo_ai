@@ -93,6 +93,7 @@ def generate_training_candidates(
             ctx=ctx,
             canonical_sales_sql=view_res.v_sales_sql if view_res.success else None,
             canonical_orders_sql=view_res.v_orders_sql if view_res.success else None,
+            canonical_purchases_sql=view_res.v_purchases_sql if view_res.success else None,
             has_debt_macros=debt_status.registered,
             runtime_rulebook_path=rulebook_path,
         )

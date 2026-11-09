@@ -20,6 +20,7 @@ data/
 *.xlsx
 *.csv
 *.parquet
+*.zip
 
 # Model Weights & LoRA Adapters
 weights/
