@@ -63,14 +63,15 @@ def find_files_recursive(search_dir: str, target_filename: str) -> List[str]:
 
 
 def find_zip_archives(search_dir: str) -> List[str]:
-    """Finds all relevant zip files in search_dir."""
+    """Finds dataset-specific zip files in search_dir (strictly filtered)."""
     zip_files = []
-    patterns = ["*train*", "*public*", "*zalo*", "*datamate*", "*lifemate*", "*.zip"]
+    # Only match exact dataset keywords - never generic '*.zip'
+    strict_patterns = ["*train*.zip", "*public*.zip", "*zalo*.zip", "*datamate*.zip"]
     for root, _, files in os.walk(search_dir):
         for f in files:
             f_lower = f.lower()
             if f_lower.endswith(".zip"):
-                for pat in patterns:
+                for pat in strict_patterns:
                     if fnmatch.fnmatch(f_lower, pat):
                         zip_files.append(os.path.join(root, f))
                         break
@@ -279,19 +280,25 @@ def main():
     log(f"Running in mode: {args.mode}", "STEP")
 
     if args.mode == "mount":
-        # Search candidate directories in Google Drive (including common folders like zalo_ai_data)
-        drive_root = args.drive_dir or "/content/drive/MyDrive"
-        # Check if common subfolder exists
-        for cand in ["/content/drive/MyDrive/zalo_ai_data", "/content/drive/MyDrive/ZaloAI_DataMate", "/content/drive/MyDrive/DataMate"]:
-            if os.path.exists(cand):
-                drive_root = cand
-                log(f"Found dedicated dataset folder in Drive: {drive_root}", "SUCCESS")
-                break
+        drive_root = args.drive_dir
+        if not drive_root:
+            # Check for dedicated competition folders first
+            for cand in ["/content/drive/MyDrive/zalo_ai_data", "/content/drive/MyDrive/ZaloAI_DataMate", "/content/drive/MyDrive/DataMate"]:
+                if os.path.exists(cand):
+                    drive_root = cand
+                    log(f"Found dedicated dataset folder in Drive: {drive_root}", "SUCCESS")
+                    break
+            if not drive_root:
+                drive_root = "/content/drive/MyDrive"
 
-        search_dirs = scan_and_extract_drive(drive_root, args.temp_dir)
-        # Also include MyDrive if dedicated folder was used, to catch any loose train.zip in MyDrive
-        if drive_root != "/content/drive/MyDrive" and os.path.exists("/content/drive/MyDrive"):
-            search_dirs.extend(scan_and_extract_drive("/content/drive/MyDrive", args.temp_dir))
+        # Check if drive_root already contains questions.jsonl
+        existing_q = find_files_recursive(drive_root, "questions.jsonl")
+        search_dirs = [drive_root]
+
+        # Only search for and extract zips if questions.jsonl files are missing
+        if not existing_q:
+            log("No questions.jsonl directly found, checking for dataset zip archives...", "INFO")
+            search_dirs = scan_and_extract_drive(drive_root, args.temp_dir)
 
         auto_restructure_dataset(search_dirs, args.target_base)
 
