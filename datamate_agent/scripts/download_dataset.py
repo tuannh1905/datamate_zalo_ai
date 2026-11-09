@@ -5,18 +5,21 @@ scripts/download_dataset.py - Robust Dataset Downloader & Normalizer for Google 
 Solves common Colab dataset issues:
 1. Google Drive rate limits and 'gdown --folder' failures.
 2. Nested folder confusion (e.g., train/train vs train).
-3. Slow Google Drive FUSE I/O by copying to fast local storage (/content/).
-4. Missing file validation & health check before starting training/inference.
+3. Scanning all splits (both train and public_test) across Google Drive.
+4. Auto-unzipping any .zip archives found on Google Drive.
+5. Slow Google Drive FUSE I/O by copying to fast local storage (/content/).
+6. Health check & clear status reporting for both train and public_test splits.
 """
 
 import argparse
+import fnmatch
 import glob
 import os
 import shutil
 import subprocess
 import sys
 import zipfile
-from typing import Optional, List, Tuple
+from typing import Optional, List, Dict, Set
 
 
 def log(msg: str, status: str = "INFO"):
@@ -49,39 +52,51 @@ def extract_zip(zip_path: str, extract_to: str):
 
 
 def find_files_recursive(search_dir: str, target_filename: str) -> List[str]:
-    """Finds all paths containing target_filename."""
+    """Finds all paths containing target_filename (case-insensitive)."""
     matches = []
+    target_lower = target_filename.lower()
     for root, _, files in os.walk(search_dir):
-        if target_filename in files:
-            matches.append(os.path.join(root, target_filename))
+        for f in files:
+            if f.lower() == target_lower:
+                matches.append(os.path.join(root, f))
     return matches
 
 
-def find_dirs_recursive(search_dir: str, target_dirname: str) -> List[str]:
-    """Finds all directories named target_dirname."""
-    matches = []
-    for root, dirs, _ in os.walk(search_dir):
-        if target_dirname in dirs:
-            matches.append(os.path.join(root, target_dirname))
-    return matches
+def find_zip_archives(search_dir: str) -> List[str]:
+    """Finds all relevant zip files in search_dir."""
+    zip_files = []
+    patterns = ["*train*", "*public*", "*zalo*", "*datamate*", "*lifemate*", "*.zip"]
+    for root, _, files in os.walk(search_dir):
+        for f in files:
+            f_lower = f.lower()
+            if f_lower.endswith(".zip"):
+                for pat in patterns:
+                    if fnmatch.fnmatch(f_lower, pat):
+                        zip_files.append(os.path.join(root, f))
+                        break
+    return list(set(zip_files))
 
 
-def auto_restructure_dataset(raw_dir: str, target_base: str):
+def auto_restructure_dataset(search_dirs: List[str], target_base: str):
     """
-    Scans raw_dir for train and public_test files and normalizes them into:
+    Scans all search_dirs for train and public_test files and normalizes them into:
       <target_base>/train/train/
-        - questions.jsonl, calendar.csv, rulebook.md, (answers.jsonl), data/
+        - questions.jsonl, calendar.csv, rulebook.md, answers.jsonl, data/
       <target_base>/public_test/public_test/
         - questions.jsonl, calendar.csv, rulebook.md, data/
     """
     log("Scanning and normalizing dataset directory structure...", "STEP")
 
-    # Find all questions.jsonl
-    q_files = find_files_recursive(raw_dir, "questions.jsonl")
-    log(f"Found {len(q_files)} questions.jsonl file(s): {q_files}")
+    all_q_files = []
+    for s_dir in search_dirs:
+        if os.path.exists(s_dir):
+            all_q_files.extend(find_files_recursive(s_dir, "questions.jsonl"))
 
-    splits_found = {}
-    for qf in q_files:
+    all_q_files = list(set(all_q_files))
+    log(f"Found {len(all_q_files)} questions.jsonl file(s): {all_q_files}")
+
+    splits_found: Dict[str, str] = {}
+    for qf in all_q_files:
         parent = os.path.dirname(qf)
         parent_lower = parent.lower()
         if "public_test" in parent_lower or "public" in parent_lower:
@@ -104,7 +119,7 @@ def auto_restructure_dataset(raw_dir: str, target_base: str):
         for fname in ["questions.jsonl", "calendar.csv", "rulebook.md", "answers.jsonl"]:
             src_file = os.path.join(source_folder, fname)
             dst_file = os.path.join(dest_folder, fname)
-            if os.path.exists(src_file) and not os.path.exists(dst_file):
+            if os.path.exists(src_file):
                 log(f"Copying {fname} to {dest_folder}")
                 shutil.copy2(src_file, dst_file)
 
@@ -122,12 +137,19 @@ def auto_restructure_dataset(raw_dir: str, target_base: str):
 def validate_and_health_check(target_base: str):
     """Checks the dataset integrity and reports item counts."""
     log("Running integrity health check on normalized dataset...", "STEP")
-    all_ok = True
+
+    has_train = False
+    has_public = False
 
     for split_name in ["train", "public_test"]:
         split_dir = os.path.join(target_base, split_name, split_name)
         if not os.path.exists(split_dir):
-            log(f"Split directory not found: {split_dir}", "WARNING")
+            if split_name == "train":
+                log(f"Split directory not found: {split_dir}", "WARNING")
+                log("👉 Lưu ý: Chưa có bộ 'train'. Bạn có thể chạy eval/test trên 'public_test'. "
+                    "Nếu muốn huấn luyện (train model), hãy upload thư mục 'train' hoặc 'train.zip' lên Google Drive.", "WARNING")
+            else:
+                log(f"Split directory not found: {split_dir}", "WARNING")
             continue
 
         q_path = os.path.join(split_dir, "questions.jsonl")
@@ -147,18 +169,44 @@ def validate_and_health_check(target_base: str):
 
         if missing:
             log(f"[{split_name}] Missing critical files: {missing}", "ERROR")
-            all_ok = False
         else:
-            # Count questions
             with open(q_path, "r", encoding="utf-8") as f:
                 num_q = sum(1 for _ in f)
             num_biz = len([d for d in os.listdir(d_path) if os.path.isdir(os.path.join(d_path, d))])
             log(f"[{split_name}] OK! Questions: {num_q} | Businesses: {num_biz} in '{split_dir}'", "SUCCESS")
+            if split_name == "train":
+                has_train = True
+            elif split_name == "public_test":
+                has_public = True
 
-    if all_ok:
-        log("All dataset splits are verified and ready for training/inference!", "SUCCESS")
-    else:
-        log("Health check finished with warnings/errors. Please inspect logs above.", "WARNING")
+    if has_train and has_public:
+        log("Tất cả bộ dữ liệu (train & public_test) đã sẵn sàng 100%!", "SUCCESS")
+    elif has_public:
+        log("Bộ dữ liệu public_test đã sẵn sàng để kiểm thử và chấm điểm!", "SUCCESS")
+
+
+def scan_and_extract_drive(drive_mount_root: str, temp_dir: str) -> List[str]:
+    """
+    Scans Google Drive for any zip files and unzips them.
+    Returns list of search candidate directories.
+    """
+    search_dirs = [drive_mount_root]
+
+    # Look for zip archives and extract
+    zips = find_zip_archives(drive_mount_root)
+    for z in zips:
+        base_name = os.path.splitext(os.path.basename(z))[0]
+        ext_target = os.path.join(temp_dir, base_name)
+        if not os.path.exists(ext_target):
+            try:
+                extract_zip(z, ext_target)
+                search_dirs.append(ext_target)
+            except Exception as e:
+                log(f"Failed to extract zip {z}: {e}", "WARNING")
+        else:
+            search_dirs.append(ext_target)
+
+    return search_dirs
 
 
 def download_with_gdown_folder(folder_url: str, output_dir: str):
@@ -171,13 +219,11 @@ def download_with_gdown_folder(folder_url: str, output_dir: str):
         import gdown
 
     os.makedirs(output_dir, exist_ok=True)
-    # Use gdown.download_folder
     log(f"Downloading from {folder_url} -> {output_dir}")
     try:
         gdown.download_folder(url=folder_url, output=output_dir, quiet=False, remaining_ok=True)
     except Exception as e:
         log(f"gdown folder download failed: {e}", "WARNING")
-        log("Tip: Google Drive frequently rate-limits folder downloads. Use Google Drive Mount or single zip download instead.", "WARNING")
         raise
 
 
@@ -194,35 +240,6 @@ def download_with_gdown_file(file_id_or_url: str, output_path: str):
     gdown.download(file_id_or_url, output=output_path, quiet=False, fuzzy=True)
 
 
-def search_drive_for_dataset() -> Optional[str]:
-    """Looks for dataset files in standard Google Drive mount locations."""
-    drive_mount_root = "/content/drive/MyDrive"
-    if not os.path.exists(drive_mount_root):
-        return None
-
-    # Look for zip archives
-    patterns = [
-        "**/*train*.zip",
-        "**/*DataMate*.zip",
-        "**/*zalo*.zip",
-        "**/*LifeMate*.zip",
-    ]
-    for pat in patterns:
-        matches = glob.glob(os.path.join(drive_mount_root, pat), recursive=True)
-        if matches:
-            log(f"Found dataset archive in Google Drive: {matches[0]}", "SUCCESS")
-            return matches[0]
-
-    # Look for existing folders containing questions.jsonl
-    q_matches = glob.glob(os.path.join(drive_mount_root, "**/questions.jsonl"), recursive=True)
-    if q_matches:
-        base = os.path.dirname(q_matches[0])
-        log(f"Found dataset folder in Google Drive: {base}", "SUCCESS")
-        return base
-
-    return None
-
-
 def main():
     parser = argparse.ArgumentParser(description="Reliable Dataset Downloader & Normalizer for Colab")
     parser.add_argument("--mode", choices=["auto", "mount", "gdown_folder", "gdown_file", "local_zip", "check_only"],
@@ -231,6 +248,7 @@ def main():
                         help="Google Drive folder or file URL")
     parser.add_argument("--file_id", default=None, help="Google Drive File ID for zip")
     parser.add_argument("--zip_path", default=None, help="Path to local or mounted zip file")
+    parser.add_argument("--drive_dir", default=None, help="Specific folder inside Google Drive to scan")
     parser.add_argument("--target_base", default="/content/dataset_gdrive",
                         help="Target base directory expected by datasets.yaml")
     parser.add_argument("--temp_dir", default="/content/raw_download",
@@ -245,30 +263,12 @@ def main():
         validate_and_health_check(args.target_base)
         return
 
-    # 1. Check if dataset is already in target_base and valid
-    train_q = os.path.join(args.target_base, "train", "train", "questions.jsonl")
-    if os.path.exists(train_q):
-        log("Existing dataset detected at target base. Verifying...", "INFO")
-        try:
-            validate_and_health_check(args.target_base)
-            log("Dataset is already present and valid! Skipping re-download.", "SUCCESS")
-            return
-        except Exception:
-            log("Existing dataset validation failed. Proceeding with download/refresh.", "WARNING")
-
-    # Mode AUTO logic:
-    # 1. First check if Google Drive is mounted and contains zip/data
-    # 2. Check if local zip exists
-    # 3. Fallback to gdown folder/file
+    # Check mode AUTO logic
     if args.mode == "auto":
-        found_in_drive = search_drive_for_dataset()
-        if found_in_drive:
-            if found_in_drive.endswith(".zip"):
-                args.mode = "local_zip"
-                args.zip_path = found_in_drive
-            else:
-                args.mode = "mount"
-                args.zip_path = found_in_drive
+        # Check if Google Drive is mounted
+        drive_root = args.drive_dir or "/content/drive/MyDrive"
+        if os.path.exists(drive_root):
+            args.mode = "mount"
         elif args.zip_path and os.path.exists(args.zip_path):
             args.mode = "local_zip"
         elif args.file_id:
@@ -278,38 +278,47 @@ def main():
 
     log(f"Running in mode: {args.mode}", "STEP")
 
-    if args.mode == "local_zip" or (args.mode == "mount" and args.zip_path and args.zip_path.endswith(".zip")):
+    if args.mode == "mount":
+        # Search candidate directories in Google Drive (including common folders like zalo_ai_data)
+        drive_root = args.drive_dir or "/content/drive/MyDrive"
+        # Check if common subfolder exists
+        for cand in ["/content/drive/MyDrive/zalo_ai_data", "/content/drive/MyDrive/ZaloAI_DataMate", "/content/drive/MyDrive/DataMate"]:
+            if os.path.exists(cand):
+                drive_root = cand
+                log(f"Found dedicated dataset folder in Drive: {drive_root}", "SUCCESS")
+                break
+
+        search_dirs = scan_and_extract_drive(drive_root, args.temp_dir)
+        # Also include MyDrive if dedicated folder was used, to catch any loose train.zip in MyDrive
+        if drive_root != "/content/drive/MyDrive" and os.path.exists("/content/drive/MyDrive"):
+            search_dirs.extend(scan_and_extract_drive("/content/drive/MyDrive", args.temp_dir))
+
+        auto_restructure_dataset(search_dirs, args.target_base)
+
+    elif args.mode == "local_zip":
         if not args.zip_path or not os.path.exists(args.zip_path):
             raise FileNotFoundError(f"Zip file not found: {args.zip_path}")
         extract_zip(args.zip_path, args.temp_dir)
-        auto_restructure_dataset(args.temp_dir, args.target_base)
-
-    elif args.mode == "mount":
-        # Copy from mounted drive directory
-        src = args.zip_path or "/content/drive/MyDrive/ZaloAI_DataMate"
-        if not os.path.exists(src):
-            raise FileNotFoundError(f"Mounted Drive folder not found: {src}")
-        auto_restructure_dataset(src, args.target_base)
+        auto_restructure_dataset([args.temp_dir], args.target_base)
 
     elif args.mode == "gdown_file":
         zip_dest = os.path.join(args.temp_dir, "dataset.zip")
         download_with_gdown_file(args.file_id or args.url, zip_dest)
         extract_zip(zip_dest, args.temp_dir)
-        auto_restructure_dataset(args.temp_dir, args.target_base)
+        auto_restructure_dataset([args.temp_dir], args.target_base)
 
     elif args.mode == "gdown_folder":
         try:
             download_with_gdown_folder(args.url, args.temp_dir)
-            auto_restructure_dataset(args.temp_dir, args.target_base)
+            auto_restructure_dataset([args.temp_dir], args.target_base)
         except Exception as e:
             log(f"Failed to download folder automatically: {e}", "ERROR")
             print("\n" + "=" * 65)
             print("🚨 KHẮC PHỤC LỖI TẢI DATASET GOOGLE DRIVE TRÊN COLAB:")
             print("Google Drive thường xuyên chặn / giới hạn tốc độ khi tải cả thư mục.")
             print("👉 CÁCH GIẢI QUYẾT TỐT NHẤT (100% THÀNH CÔNG):")
-            print("  1. Mở link Google Drive trên trình duyệt, bấm Tải xuống (Download zip).")
-            print("  2. Upload file zip vào Google Drive cá nhân của bạn (ví dụ MyDrive/train.zip).")
-            print("  3. Trong Colab, chạy:")
+            print("  1. Upload file 'train.zip' hoặc folder 'train' vào Google Drive.")
+            print("  2. Trong Colab, chạy:")
             print("       from google.colab import drive")
             print("       drive.mount('/content/drive')")
             print("       !python scripts/download_dataset.py --mode auto")
