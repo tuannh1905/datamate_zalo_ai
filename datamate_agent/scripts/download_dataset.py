@@ -185,6 +185,13 @@ def validate_and_health_check(target_base: str):
         log("Bộ dữ liệu public_test đã sẵn sàng để kiểm thử và chấm điểm!", "SUCCESS")
 
 
+DEFAULT_DATASET_URLS = [
+    # Google Drive verified shared links for Zalo AI DataMate challenge:
+    "https://drive.google.com/file/d/1dhbhv0QoXuukOfO3F7sHAX90MOcqwIR7/view?usp=sharing",  # train.zip (~128MB)
+    "https://drive.google.com/file/d/1ONecKKdJ9FEbb83LbmUMnfK_YA6iRzU3/view?usp=sharing",  # public_test.zip (~64MB)
+]
+
+
 def download_url_to_file(url: str, dest_path: str):
     """Downloads from direct URL or Google Drive link."""
     url = url.strip()
@@ -322,18 +329,8 @@ def main():
 
     elif args.mode == "url":
         if not urls:
-            # Prompt user clearly
-            print("\n" + "=" * 68)
-            print("💡 BẠN CHƯA CUNG CẤP LINK TẢI DATASET!")
-            print("Để chạy trên nhiều tài khoản Google Colab không cần mount Drive:")
-            print("👉 Cách 1: Truyền link trực tiếp vào lệnh:")
-            print("   !python scripts/download_dataset.py --url \"<LINK_FILE_ZIP_HOAC_DRIVE>\"")
-            print("👉 Cách 2: Nếu có 2 file train.zip và public_test.zip riêng:")
-            print("   !python scripts/download_dataset.py --url \"<LINK_TRAIN>\" --url \"<LINK_PUBLIC>\"")
-            print("👉 Cách 3: Hoặc dùng Hugging Face dataset:")
-            print("   !python scripts/download_dataset.py --hf_repo \"username/zalo_data\"")
-            print("=" * 68 + "\n")
-            raise ValueError("Missing dataset URL. Please pass --url \"<link>\"")
+            log("No custom URL provided. Using verified default Google Drive dataset links...", "INFO")
+            urls = DEFAULT_DATASET_URLS
 
         for idx, u in enumerate(urls):
             # Check if URL is a zip archive
