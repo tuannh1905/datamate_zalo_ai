@@ -253,10 +253,11 @@ def run_inference_pipeline(
                         raw_completion=f"Notes:\n- [Self-Repaired Query]\nTYPE: {cand1.parsed_type}\n```sql\n{repaired_sql}\n```",
                         orig_question=q_text,
                     )
-                    candidates.append(cand_repair)
-                    rep_is_high, _, _ = verify_candidate_execution(cand_repair, q_text, as_of_date)
-                    if rep_is_high:
-                        logger.info(f"Question [{q_id}]: Tier 2 Self-Repair succeeded with high confidence!")
+                    if cand_repair.success and cand_repair.vote_key:
+                        logger.info(f"Question [{q_id}]: Tier 2 Self-Repair succeeded (answer={cand_repair.normalized_value})!")
+                        candidates = [cand_repair]
+                    else:
+                        candidates.append(cand_repair)
 
             # Check intermediate agreement for multi-sample or tough edge cases
             valid_keys = [c.vote_key for c in candidates if c.success and c.vote_key]

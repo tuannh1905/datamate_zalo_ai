@@ -356,8 +356,10 @@ class ExecutorVoter:
         if not sql or not sql.strip():
             return False, None, "Empty SQL query", []
 
-        # Strip comments
-        cleaned_sql = re.sub(r"--[^\n]*", "", sql)
+        # Strip comments and stray markdown code fences
+        cleaned_sql = re.sub(r"```(?:sql)?", "", sql, flags=re.IGNORECASE)
+        cleaned_sql = re.sub(r"```", "", cleaned_sql)
+        cleaned_sql = re.sub(r"--[^\n]*", "", cleaned_sql)
         cleaned_sql = re.sub(r"/\*[\s\S]*?\*/", "", cleaned_sql).strip()
         cleaned_sql = cleaned_sql.rstrip(";")
 
@@ -441,6 +443,8 @@ class ExecutorVoter:
                 if not raw_out.strip().startswith("```"):
                     raw_out = "```sql\n" + raw_out
                 _, rep_sql = parse_completion(raw_out)
+                if rep_sql:
+                    rep_sql = re.sub(r"```.*$", "", rep_sql).strip().rstrip(";")
                 return rep_sql
         except Exception as e:
             logger.debug(f"Repair turn failed: {e}")
@@ -597,7 +601,9 @@ class ExecutorVoter:
 
         key_counts = Counter(c.vote_key for c in valid_candidates)
         top_key, top_count = key_counts.most_common(1)[0]
-        share = top_count / len(candidates)
+        # In single-shot or self-repair workflows (len <= 2), evaluate agreement over valid executions.
+        # In multi-sample ensemble voting (len >= 3), require majority over total candidates.
+        share = (top_count / total_valid) if len(candidates) <= 2 else (top_count / len(candidates))
 
         if share >= self.tau:
             winning_candidate = next(c for c in valid_candidates if c.vote_key == top_key)

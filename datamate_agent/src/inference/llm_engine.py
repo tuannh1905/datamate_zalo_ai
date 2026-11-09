@@ -169,20 +169,21 @@ class LLMEngine:
             return self.hf_tokenizer
         return None
 
-    def _prepare_inputs(self, prompt: str, max_tokens: int = 3584) -> Tuple[Dict[str, Any], int]:
+    def _prepare_inputs(self, prompt: str, max_tokens: int = 8192) -> Tuple[Dict[str, Any], int]:
         """
         Tokenizes on CPU and safely windows the prompt to avoid quadratic attention OOM on 16GB GPUs like Tesla T4.
-        If prompt > max_tokens, preserves the first 1280 tokens (system rules) + last (max_tokens - 1280) tokens (user question).
+        For Qwen 3B, 8192 tokens uses < 3.5GB VRAM (well within 15GB T4 VRAM limit).
+        If prompt > max_tokens, preserves the first 6144 tokens (rules + database schema) + last (max_tokens - 6144) tokens (user question).
         """
         # 1. Tokenize strictly on CPU first to prevent oversized tensors in GPU VRAM
         inputs = self.hf_tokenizer(prompt, return_tensors="pt")
         total_tokens = inputs["input_ids"].shape[1]
         if total_tokens > max_tokens:
-            keep_sys = 1280
+            keep_sys = 6144
             keep_user = max_tokens - keep_sys
             logger.info(
                 f"[VRAM Guard] Prompt length ({total_tokens} tokens) exceeds safe threshold ({max_tokens} tokens). "
-                f"Windowing on CPU: keeping first {keep_sys} tokens (system rules) + last {keep_user} tokens (user query)."
+                f"Windowing on CPU: keeping first {keep_sys} tokens (rules + schema) + last {keep_user} tokens (user query)."
             )
             input_ids = torch.cat([inputs["input_ids"][:, :keep_sys], inputs["input_ids"][:, -keep_user:]], dim=1)
             attention_mask = torch.cat([inputs["attention_mask"][:, :keep_sys], inputs["attention_mask"][:, -keep_user:]], dim=1)
@@ -227,7 +228,7 @@ class LLMEngine:
                 torch.cuda.empty_cache()
             results = []
             for prompt in prompts:
-                inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=3584)
+                inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=8192)
                 do_sample = temperature > 0.0
                 gen_kwargs: Dict[str, Any] = {
                     "max_new_tokens": min(max_new_tokens, 256),
@@ -291,7 +292,7 @@ class LLMEngine:
             gc.collect()
             if HAS_CUDA:
                 torch.cuda.empty_cache()
-            inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=3584)
+            inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=8192)
             do_sample = temperature > 0.0
             results = []
             

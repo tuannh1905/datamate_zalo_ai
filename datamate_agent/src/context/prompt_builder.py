@@ -62,13 +62,14 @@ Date Anchors: Tháng này: từ 2026-08-01 đến 2026-08-20.
 Notes:
 - [Entity & Time analysis]: Target is total sales revenue for 'tháng này' (2026-08-01 to 2026-08-20).
 - [Logic & Formulas]: Refer to Business Rulebook for revenue definitions and status filters. Sum of valid order line amounts.
+- [Database Schema Matching]: Query the actual tables present in the database schema (e.g. don_hang_chi_tiet or raw sales tables).
 - [Output Type]: number (integer VND).
 TYPE: number
 ```sql
-SELECT ROUND(SUM(line_amount), 0) AS answer
-FROM v_sales
-WHERE order_date BETWEEN '2026-08-01' AND '2026-08-20'
-  AND is_valid_sales = TRUE;
+SELECT ROUND(SUM(thanh_tien), 0) AS answer
+FROM don_hang_chi_tiet
+WHERE TRY_CAST(ngay AS DATE) BETWEEN '2026-08-01' AND '2026-08-20'
+  AND LOWER(trang_thai) NOT IN ('huỷ', 'trả hàng');
 ```
 
 Example 2 (Tỉ lệ tăng trưởng doanh thu so với kỳ trước - percent):
@@ -105,9 +106,14 @@ Notes:
 - [Output Type]: list.
 TYPE: list
 ```sql
-SELECT product_name
-FROM v_sales
-WHERE order_date BETWEEN '2026-07-01' AND '2026-07-31'
+SELECT ten_san_pham
+FROM don_hang_chi_tiet
+WHERE TRY_CAST(ngay AS DATE) BETWEEN '2026-07-01' AND '2026-07-31'
+  AND LOWER(trang_thai) NOT IN ('huỷ', 'trả hàng')
+GROUP BY ten_san_pham, ma_san_pham
+ORDER BY SUM(so_luong) DESC, ma_san_pham ASC
+LIMIT 3;
+```
   AND is_valid_sales = TRUE
 GROUP BY product_id, product_name
 ORDER BY SUM(quantity_base) DESC, product_id ASC
