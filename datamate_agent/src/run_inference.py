@@ -41,6 +41,7 @@ def run_inference_pipeline(
     adapter_override: Optional[str] = None,
     limit: Optional[int] = None,
     allow_mock: bool = False,
+    k_override: Optional[int] = None,
 ) -> None:
     # 1. Load Configuration
     # 1. Load Configuration & Resolve Model/Adapter Paths
@@ -50,9 +51,10 @@ def run_inference_pipeline(
             config = yaml.safe_load(f)
 
     inf_cfg = config.get("inference", {})
-    k_samples = inf_cfg.get("num_samples_k", 8)
-    thinking_k = inf_cfg.get("num_thinking_samples", 4)
+    k_samples = k_override if k_override is not None else inf_cfg.get("num_samples_k", 1)
+    thinking_k = 0 if k_samples == 1 else inf_cfg.get("num_thinking_samples", 0)
     tau = inf_cfg.get("agreement_threshold_tau", 0.5)
+    logger.info(f"Inference Mode: k_samples={k_samples}, thinking_k={thinking_k}, tau={tau}")
 
     # Resolution priority: CLI override > Env var > paths.*_dir on disk > config.model
     paths_cfg = config.get("paths", {})

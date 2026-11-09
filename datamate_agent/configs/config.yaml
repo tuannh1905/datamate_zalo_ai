@@ -32,16 +32,16 @@ model:
   trust_remote_code: true
 
 inference:
-  # Sampling parameters for plain samples (k=8)
-  num_samples_k: 8
-  temperature: 0.1
+  # Sampling parameters for plain samples (k=1 for fast greedy decoding, set k=3 or 8 for voting)
+  num_samples_k: 1
+  temperature: 0.0
   top_p: 0.95
-  max_new_tokens: 1024
+  max_new_tokens: 512
   
-  # Thinking / Deep reasoning samples (+4 on low agreement)
-  num_thinking_samples: 4
+  # Thinking / Deep reasoning samples (0 for fast, +2 or +4 on low agreement)
+  num_thinking_samples: 0
   thinking_temperature: 0.6
-  thinking_max_new_tokens: 2048
+  thinking_max_new_tokens: 1024
   
   # Voting & Abstain policy
   agreement_threshold_tau: 0.5  # Need >= 50% majority agreement
