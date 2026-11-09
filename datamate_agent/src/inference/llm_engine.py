@@ -83,7 +83,7 @@ class LLMEngine:
         # 2. If vLLM is not active but CUDA is available, use HuggingFace Transformers
         if not self.is_offline_vllm and HAS_CUDA and (os.path.exists(model_name_or_path) or "/" in model_name_or_path):
             try:
-                from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+                from transformers import AutoModelForCausalLM, AutoTokenizer
                 logger.info(f"Loading Hugging Face model on GPU: {model_name_or_path}")
                 self.hf_tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
                 
@@ -96,21 +96,39 @@ class LLMEngine:
                         pass
                 compute_dtype = torch.bfloat16 if is_ampere_or_later else torch.float16
 
-                bnb_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=compute_dtype,
-                    bnb_4bit_use_double_quant=True,
-                )
+                loaded_successfully = False
+                # Try 4-bit quantization first (essential for T4 16GB GPU)
                 try:
+                    from transformers import BitsAndBytesConfig
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=compute_dtype,
+                        bnb_4bit_use_double_quant=True,
+                    )
                     self.hf_model = AutoModelForCausalLM.from_pretrained(
                         model_name_or_path,
                         quantization_config=bnb_config,
                         device_map="auto",
                         trust_remote_code=trust_remote_code,
                     )
+                    loaded_successfully = True
+                    logger.info("Successfully loaded model with BitsAndBytes 4-bit (NF4) quantization.")
                 except Exception as bnb_err:
-                    logger.warning(f"BitsAndBytes 4-bit load failed ({bnb_err}). Falling back to native float precision...")
+                    logger.warning(f"BitsAndBytes 4-bit load failed or unavailable ({bnb_err}). Trying load_in_4bit=True...")
+                    try:
+                        self.hf_model = AutoModelForCausalLM.from_pretrained(
+                            model_name_or_path,
+                            load_in_4bit=True,
+                            device_map="auto",
+                            trust_remote_code=trust_remote_code,
+                        )
+                        loaded_successfully = True
+                        logger.info("Successfully loaded model with load_in_4bit=True.")
+                    except Exception as bnb_err2:
+                        logger.warning(f"4-bit load failed ({bnb_err2}). Falling back to native float precision...")
+
+                if not loaded_successfully:
                     self.hf_model = AutoModelForCausalLM.from_pretrained(
                         model_name_or_path,
                         torch_dtype=compute_dtype,
@@ -234,25 +252,26 @@ class LLMEngine:
 
         if self.is_hf_gpu and self.hf_model is not None and self.hf_tokenizer is not None:
             inputs = self.hf_tokenizer(prompt, return_tensors="pt").to(self.hf_model.device)
-            do_sample = temperature > 0.0
-            gen_kwargs: Dict[str, Any] = {
-                "max_new_tokens": max_new_tokens,
-                "do_sample": do_sample,
-                "pad_token_id": self.hf_tokenizer.eos_token_id,
-            }
-            if do_sample:
-                gen_kwargs["temperature"] = temperature
-                gen_kwargs["top_p"] = top_p
-                if n > 1:
-                    gen_kwargs["num_return_sequences"] = n
-            with torch.no_grad():
-                gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
-            
-            results = []
             prompt_len = inputs["input_ids"].shape[1]
-            for seq in gen_tokens:
-                out_text = self.hf_tokenizer.decode(seq[prompt_len:], skip_special_tokens=True)
+            do_sample = temperature > 0.0
+            results = []
+            
+            # Generate one-by-one or in small batches to preserve VRAM on Colab T4
+            for _ in range(n):
+                gen_kwargs: Dict[str, Any] = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": do_sample,
+                    "pad_token_id": self.hf_tokenizer.eos_token_id,
+                }
+                if do_sample:
+                    gen_kwargs["temperature"] = temperature
+                    gen_kwargs["top_p"] = top_p
+                with torch.no_grad():
+                    gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
+                out_text = self.hf_tokenizer.decode(gen_tokens[0][prompt_len:], skip_special_tokens=True)
                 results.append(out_text)
+                if HAS_CUDA:
+                    torch.cuda.empty_cache()
             return results
 
         # Fallback Mock Mode
