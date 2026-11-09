@@ -5,12 +5,13 @@ with seamless fallback to Hugging Face Transformers GPU (4-bit/bfloat16)
 and CPU mock mode.
 """
 
+import gc
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Set PyTorch allocation conf to avoid VRAM fragmentation on 16GB GPUs like Colab T4
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Set PyTorch allocation conf to avoid VRAM fragmentation and virtual memory mapping errors on Colab T4
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
 logger = logging.getLogger(__name__)
 
@@ -168,25 +169,31 @@ class LLMEngine:
             return self.hf_tokenizer
         return None
 
-    def _prepare_inputs(self, prompt: str, max_tokens: int = 6144) -> Tuple[Dict[str, Any], int]:
+    def _prepare_inputs(self, prompt: str, max_tokens: int = 3584) -> Tuple[Dict[str, Any], int]:
         """
-        Tokenizes and safely windows the prompt to avoid quadratic attention OOM on 16GB GPUs like Tesla T4.
-        If prompt > max_tokens, preserves the first 2048 tokens (system rules) + last (max_tokens - 2048) tokens (user question).
+        Tokenizes on CPU and safely windows the prompt to avoid quadratic attention OOM on 16GB GPUs like Tesla T4.
+        If prompt > max_tokens, preserves the first 1280 tokens (system rules) + last (max_tokens - 1280) tokens (user question).
         """
-        inputs = self.hf_tokenizer(prompt, return_tensors="pt").to(self.hf_model.device)
+        # 1. Tokenize strictly on CPU first to prevent oversized tensors in GPU VRAM
+        inputs = self.hf_tokenizer(prompt, return_tensors="pt")
         total_tokens = inputs["input_ids"].shape[1]
         if total_tokens > max_tokens:
-            keep_sys = 2048
+            keep_sys = 1280
             keep_user = max_tokens - keep_sys
             logger.info(
                 f"[VRAM Guard] Prompt length ({total_tokens} tokens) exceeds safe threshold ({max_tokens} tokens). "
-                f"Windowing: keeping first {keep_sys} tokens (system rules) + last {keep_user} tokens (user query)."
+                f"Windowing on CPU: keeping first {keep_sys} tokens (system rules) + last {keep_user} tokens (user query)."
             )
             input_ids = torch.cat([inputs["input_ids"][:, :keep_sys], inputs["input_ids"][:, -keep_user:]], dim=1)
             attention_mask = torch.cat([inputs["attention_mask"][:, :keep_sys], inputs["attention_mask"][:, -keep_user:]], dim=1)
+            del inputs
             inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
-            return inputs, input_ids.shape[1]
-        return inputs, total_tokens
+            total_tokens = input_ids.shape[1]
+        
+        # 2. Transfer only the windowed tensors to GPU device
+        gpu_inputs = {k: v.to(self.hf_model.device) for k, v in inputs.items()}
+        del inputs
+        return gpu_inputs, total_tokens
 
     def generate_batch(
         self,
@@ -215,14 +222,15 @@ class LLMEngine:
             return [[output.outputs[0].text for output in outputs]]
 
         if self.is_hf_gpu and self.hf_model is not None and self.hf_tokenizer is not None:
+            gc.collect()
             if HAS_CUDA:
                 torch.cuda.empty_cache()
             results = []
             for prompt in prompts:
-                inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=6144)
+                inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=3584)
                 do_sample = temperature > 0.0
                 gen_kwargs: Dict[str, Any] = {
-                    "max_new_tokens": min(max_new_tokens, 512),
+                    "max_new_tokens": min(max_new_tokens, 256),
                     "do_sample": do_sample,
                     "pad_token_id": self.hf_tokenizer.eos_token_id,
                 }
@@ -233,6 +241,8 @@ class LLMEngine:
                     gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
                 out_text = self.hf_tokenizer.decode(gen_tokens[0][prompt_len:], skip_special_tokens=True)
                 results.append([out_text])
+                del gen_tokens
+                del inputs
                 if HAS_CUDA:
                     torch.cuda.empty_cache()
             return results
@@ -278,16 +288,17 @@ class LLMEngine:
             return [out.text for out in outputs[0].outputs]
 
         if self.is_hf_gpu and self.hf_model is not None and self.hf_tokenizer is not None:
+            gc.collect()
             if HAS_CUDA:
                 torch.cuda.empty_cache()
-            inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=6144)
+            inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=3584)
             do_sample = temperature > 0.0
             results = []
             
             # Generate one-by-one or in small batches to preserve VRAM on Colab T4
             for _ in range(n):
                 gen_kwargs: Dict[str, Any] = {
-                    "max_new_tokens": min(max_new_tokens, 512),
+                    "max_new_tokens": min(max_new_tokens, 256),
                     "do_sample": do_sample,
                     "pad_token_id": self.hf_tokenizer.eos_token_id,
                 }
@@ -298,8 +309,10 @@ class LLMEngine:
                     gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
                 out_text = self.hf_tokenizer.decode(gen_tokens[0][prompt_len:], skip_special_tokens=True)
                 results.append(out_text)
+                del gen_tokens
                 if HAS_CUDA:
                     torch.cuda.empty_cache()
+            del inputs
             return results
 
         # Fallback Mock Mode
