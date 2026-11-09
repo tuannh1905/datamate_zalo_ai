@@ -68,7 +68,7 @@ def run_inference_pipeline(
             model_path = paths_cfg["model_dir"]
             model_source = f"Local paths.model_dir ({model_path})"
         else:
-            model_path = model_cfg.get("base_model_name_or_path", "Qwen/Qwen2.5-Coder-7B-Instruct")
+            model_path = model_cfg.get("base_model_name_or_path", "Qwen/Qwen2.5-Coder-3B-Instruct")
             model_source = "Config base_model_name_or_path"
 
     adapter_source = "CLI override"

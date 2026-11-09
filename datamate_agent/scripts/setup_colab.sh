@@ -24,7 +24,7 @@ else
 fi
 
 echo "=== [3/4] Downloading Base Model Weights (Offline Preparation) ==="
-MODEL_ID="Qwen/Qwen2.5-Coder-7B-Instruct"
+MODEL_ID="Qwen/Qwen2.5-Coder-3B-Instruct"
 WEIGHTS_DIR="./weights/base_model"
 mkdir -p "${WEIGHTS_DIR}"
 

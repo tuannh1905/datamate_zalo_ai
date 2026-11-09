@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def train_qlora(
     dataset_path: str,
     output_adapter_dir: str,
-    base_model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    base_model_name: str = "Qwen/Qwen2.5-Coder-3B-Instruct",
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
@@ -261,7 +261,7 @@ def main():
     parser = argparse.ArgumentParser(description="Fine-tune Student model with 4-bit QLoRA.")
     parser.add_argument("--dataset", required=True, help="Path to sft_dataset.jsonl")
     parser.add_argument("--output_dir", required=True, help="Path to save adapter")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-Coder-7B-Instruct", help="Base model")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-Coder-3B-Instruct", help="Base model")
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=2, help="Per device batch size")
     parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps")

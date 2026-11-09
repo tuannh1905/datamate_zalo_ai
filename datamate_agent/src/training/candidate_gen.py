@@ -172,7 +172,7 @@ def main():
     parser.add_argument("--rulebook", default=None, help="Path to rulebook.md")
     parser.add_argument("--calendar", default=None, help="Path to calendar.csv")
     parser.add_argument("--output", required=True, help="Path to output candidates.jsonl")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-Coder-7B-Instruct", help="Model name or path")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-Coder-3B-Instruct", help="Model name or path")
     parser.add_argument("--adapter", default=None, help="LoRA adapter path")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of questions")
     args = parser.parse_args()
