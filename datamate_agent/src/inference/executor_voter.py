@@ -398,6 +398,9 @@ class ExecutorVoter:
         P1-15: Requests the LLM to fix a failed SQL statement given DuckDB error message,
         compact database schema context, and formatted via build_chat_prompt.
         """
+        if not self.llm_engine:
+            return None
+
         from ..context.prompt_builder import build_chat_prompt
         compact_schema = self.schema_summary or ""
         messages = [
@@ -497,10 +500,22 @@ class ExecutorVoter:
         for turn in range(self.max_repairs + 1):
             ok, res_rows, err, cols = self.execute_single_sql(current_sql, pred_type)
             if ok:
-                success = True
-                rows = res_rows
-                col_names = cols
-                break
+                norm_val = cast_duckdb_result(res_rows, pred_type, cols, sql=current_sql)
+                if norm_val is not None:
+                    success = True
+                    rows = res_rows
+                    col_names = cols
+                    break
+                else:
+                    # Query executed but produced NULL or 0 rows
+                    last_error = f"Query executed successfully but returned NULL or empty output for TYPE '{pred_type}'"
+                    if turn < self.max_repairs:
+                        rep = self.repair_sql_turn(current_sql, last_error, orig_question)
+                        if rep:
+                            current_sql = rep
+                            repair_count += 1
+                            continue
+                    break
             else:
                 last_error = err
                 if turn < self.max_repairs:

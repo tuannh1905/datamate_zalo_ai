@@ -24,6 +24,7 @@ from .data_layer.ingest import BusinessContext, load_business_data, resolve_busi
 from .data_layer.view_builder import build_canonical_views
 from .inference.executor_voter import CandidateExecution, ExecutorVoter, QuestionInferenceResult
 from .inference.llm_engine import LLMEngine
+from .inference.verifier import verify_candidate_execution
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DataMateRunner")
@@ -205,43 +206,76 @@ def run_inference_pipeline(
                 prefill="Notes:\n-",
             )
 
-            # Generate initial k=8 plain samples
-            plain_outputs = llm_engine.generate_single(
-                prompt=full_prompt,
-                n=k_samples,
-                temperature=0.1,
-                max_new_tokens=1024,
-            )
-
             candidates: List[CandidateExecution] = []
-            for idx, comp in enumerate(plain_outputs):
-                full_text = "Notes:\n-" + comp
-                cand = voter.process_candidate(
-                    sample_id=idx,
-                    raw_completion=full_text,
-                    orig_question=q_text,
-                )
-                candidates.append(cand)
 
-            # Check intermediate agreement
+            # --- TIER 1: Fast Greedy Inference (k=1, temp=0.0) ---
+            t1_outputs = llm_engine.generate_single(
+                prompt=full_prompt,
+                n=1,
+                temperature=0.0,
+                max_new_tokens=512,
+            )
+            cand1 = voter.process_candidate(
+                sample_id=0,
+                raw_completion="Notes:\n-" + t1_outputs[0],
+                orig_question=q_text,
+            )
+            candidates.append(cand1)
+
+            is_high_conf, conf_score, failure_reason = verify_candidate_execution(cand1, q_text, as_of_date)
+
+            # If user explicitly requested voting (k_samples > 1), collect remaining samples
+            if k_samples > 1:
+                needed = k_samples - 1
+                more_outputs = llm_engine.generate_single(
+                    prompt=full_prompt,
+                    n=needed,
+                    temperature=0.2,
+                    max_new_tokens=512,
+                )
+                for idx, comp in enumerate(more_outputs):
+                    c = voter.process_candidate(
+                        sample_id=1 + idx,
+                        raw_completion="Notes:\n-" + comp,
+                        orig_question=q_text,
+                    )
+                    candidates.append(c)
+            elif not is_high_conf and cand1.parsed_sql:
+                # --- TIER 2: In-Context Reflection & Self-Correction ---
+                # Pass 1 failed (Syntax error, duckdb error, NULL output, or type mismatch)
+                # Feed previous SQL + exact error traceback to model for smart self-repair
+                repair_err = cand1.error or failure_reason or "Query output was invalid or inconsistent with schema"
+                logger.info(f"Question [{q_id}]: Tier 1 failed ({repair_err}). Triggering Tier 2 In-Context Self-Repair...")
+                repaired_sql = voter.repair_sql_turn(cand1.parsed_sql, repair_err, q_text)
+                if repaired_sql:
+                    cand_repair = voter.process_candidate(
+                        sample_id=1,
+                        raw_completion=f"Notes:\n- [Self-Repaired Query]\nTYPE: {cand1.parsed_type}\n```sql\n{repaired_sql}\n```",
+                        orig_question=q_text,
+                    )
+                    candidates.append(cand_repair)
+                    rep_is_high, _, _ = verify_candidate_execution(cand_repair, q_text, as_of_date)
+                    if rep_is_high:
+                        logger.info(f"Question [{q_id}]: Tier 2 Self-Repair succeeded with high confidence!")
+
+            # Check intermediate agreement for multi-sample or tough edge cases
             valid_keys = [c.vote_key for c in candidates if c.success and c.vote_key]
             from collections import Counter
             top_share = (Counter(valid_keys).most_common(1)[0][1] / len(candidates)) if valid_keys else 0.0
 
-            # If low agreement, trigger +4 thinking samples
-            if top_share < tau and thinking_k > 0:
+            # --- TIER 3: Fallback Thinking Samples (only when agreement is low and thinking_k is configured) ---
+            if top_share < tau and thinking_k > 0 and len(candidates) < (k_samples + thinking_k):
                 logger.debug(f"Question {q_id}: Agreement {top_share:.2f} < tau={tau}. Triggering +{thinking_k} thinking samples.")
                 thinking_outputs = llm_engine.generate_single(
                     prompt=full_prompt,
                     n=thinking_k,
                     temperature=0.6,
-                    max_new_tokens=2048,
+                    max_new_tokens=1024,
                 )
                 for idx, comp in enumerate(thinking_outputs):
-                    full_text = "Notes:\n-" + comp
                     cand = voter.process_candidate(
-                        sample_id=k_samples + idx,
-                        raw_completion=full_text,
+                        sample_id=len(candidates),
+                        raw_completion="Notes:\n-" + comp,
                         orig_question=q_text,
                     )
                     candidates.append(cand)

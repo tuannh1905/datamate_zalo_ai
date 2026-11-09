@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from ..data_layer.ingest import BusinessContext
 from .date_resolver import DateResolution, DateResolver
+from .rule_router import route_rulebook
 
 logger = logging.getLogger(__name__)
 
@@ -177,11 +178,18 @@ class PromptBuilder:
                     pass
         return "Apply standard DataMate business rules: Revenue excludes cancelled & returned orders."
 
-    def build_system_prompt(self, runtime_rulebook_path: Optional[str] = None) -> str:
+    def build_system_prompt(
+        self,
+        runtime_rulebook_path: Optional[str] = None,
+        question: Optional[str] = None,
+    ) -> str:
         """
-        Injects dynamic rulebook into system prompt.
+        Injects dynamic, selectively routed rulebook into system prompt.
+        If question is provided, prunes irrelevant sections to optimize context length and GPU prefill.
         """
         rulebook_text = self.get_rulebook_content(runtime_rulebook_path)
+        if question:
+            rulebook_text = route_rulebook(rulebook_text, question)
         return self.system_template.format(rulebook_content=rulebook_text)
 
     def build_user_prompt(
@@ -250,7 +258,7 @@ class PromptBuilder:
         """
         Creates OpenAI/vLLM format message list with Assistant prefill.
         """
-        sys_prompt = self.build_system_prompt(runtime_rulebook_path)
+        sys_prompt = self.build_system_prompt(runtime_rulebook_path, question=question)
         user_prompt = self.build_user_prompt(
             question=question,
             as_of_date=as_of_date,
