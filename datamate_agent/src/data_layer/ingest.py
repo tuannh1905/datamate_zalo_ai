@@ -38,10 +38,19 @@ class BusinessContext:
                 else:
                     col_desc.append(f"  - {c['name']} ({dtype})")
             
-            # Fetch sample rows
+            # Fetch compact sample rows (truncated to prevent VRAM explosion on large tables)
             try:
-                samples = self.con.execute(f"SELECT * FROM {tbl} LIMIT 2").fetchall()
-                sample_str = f"Sample rows ({len(samples)}): {samples}"
+                raw_samples = self.con.execute(f"SELECT * FROM {tbl} LIMIT 2").fetchall()
+                compact_samples = []
+                for row in raw_samples:
+                    compact_row = tuple(
+                        (str(v)[:30] + "...") if isinstance(v, str) and len(str(v)) > 30 else v
+                        for v in row
+                    )
+                    compact_samples.append(compact_row)
+                sample_str = f"Sample rows ({len(compact_samples)}): {compact_samples}"
+                if len(sample_str) > 300:
+                    sample_str = sample_str[:300] + "...]"
             except Exception:
                 sample_str = ""
 

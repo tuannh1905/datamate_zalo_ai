@@ -196,10 +196,10 @@ class PromptBuilder:
         """
         Assembles full user prompt following token budget distribution.
         """
-        # 1. Truncate README if necessary
+        # 1. Truncate README if necessary (keep concise to protect GPU memory)
         readme = ctx.readme_text.strip()
-        if len(readme) > 2500:
-            readme = readme[:2500] + "\n...[truncated]"
+        if len(readme) > 1000:
+            readme = readme[:1000] + "\n...[truncated]"
         if not readme:
             readme = "No README provided."
 
