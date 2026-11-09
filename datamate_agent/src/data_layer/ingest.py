@@ -49,19 +49,143 @@ class BusinessContext:
         return "\n".join(lines)
 
 
+def fix_mojibake_filename(name: str) -> str:
+    """Attempts to fix cp437 mojibake encoding produced by zip / gdown."""
+    try:
+        return name.encode("cp437").decode("utf-8")
+    except Exception:
+        return name
+
+
 def normalize_identifier(name: str) -> str:
     """
     Normalizes column or table names into clean snake_case ASCII strings.
     E.g. 'Mã đơn hàng' -> 'ma_don_hang', 'Giá bán (VND)' -> 'gia_ban_vnd'.
+    Handles mojibake encoding recovery and Vietnamese 'đ'/'Đ' conversion.
     """
     if not name or not isinstance(name, str):
         return "col"
-    nfkd = unicodedata.normalize("NFKD", str(name).strip())
+    fixed_name = fix_mojibake_filename(str(name).strip())
+    # Replace Vietnamese đ/Đ explicitly before NFKD
+    fixed_name = fixed_name.replace("đ", "d").replace("Đ", "D")
+    nfkd = unicodedata.normalize("NFKD", fixed_name)
     ascii_text = nfkd.encode("ascii", "ignore").decode("utf-8")
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", ascii_text.lower()).strip("_")
     if cleaned and cleaned[0].isdigit():
         cleaned = "col_" + cleaned
     return cleaned or "col"
+
+
+def resolve_business_dir(data_dir: str, business_id: str) -> Optional[str]:
+    """
+    Resolves the actual directory for a business.
+    Tries in order:
+    1. <data_dir>/<business_id>
+    2. <data_dir>/data/<business_id>
+    3. One-level subdirectory scan: <data_dir>/*/<business_id> and <data_dir>/*/data/<business_id>
+    Returns absolute path if found, or None if not found.
+    """
+    if not data_dir or not business_id:
+        return None
+
+    # Candidate paths to test directly
+    candidates = [
+        os.path.join(data_dir, business_id),
+        os.path.join(data_dir, "data", business_id),
+    ]
+    for c in candidates:
+        if os.path.exists(c) and os.path.isdir(c):
+            return os.path.abspath(c)
+
+    # Scan one level of subdirectories
+    if os.path.exists(data_dir) and os.path.isdir(data_dir):
+        try:
+            for entry in os.listdir(data_dir):
+                sub = os.path.join(data_dir, entry)
+                if os.path.isdir(sub):
+                    sub_cands = [
+                        os.path.join(sub, business_id),
+                        os.path.join(sub, "data", business_id),
+                    ]
+                    for sc in sub_cands:
+                        if os.path.exists(sc) and os.path.isdir(sc):
+                            return os.path.abspath(sc)
+        except Exception:
+            pass
+
+    return None
+
+
+def parse_vietnamese_number_scalar(val: Any) -> Optional[float]:
+    """
+    Parses a single scalar into a float according to Vietnamese number formatting.
+    Handles:
+      - '25.000đ' -> 25000.0
+      - '12,5' -> 12.5
+      - '1.234,56' -> 1234.56
+      - '1,234,567' -> 1234567.0
+      - '1.234.567' -> 1234567.0
+      - '12,5%' -> 12.5
+      - '12.5' -> 12.5
+    """
+    if val is None or pd.isna(val):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "null", "-", "—"):
+        return None
+
+    # Strip currency and percentage symbols and trailing/leading whitespace
+    s = re.sub(r"(?i)\s*(?:đ|vnd|dong|%)\s*$", "", s).strip()
+    s = re.sub(r"(?i)^(?:đ|vnd|dong)\s*", "", s).strip()
+    s = s.replace(" ", "")
+
+    if not s:
+        return None
+
+    has_dot = "." in s
+    has_comma = "," in s
+
+    # Both dot and comma present
+    if has_dot and has_comma:
+        last_dot = s.rfind(".")
+        last_comma = s.rfind(",")
+        if last_dot < last_comma:
+            # e.g. "1.234,56" or "1.234.567,89" -> dot is thousands, comma is decimal
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            # e.g. "1,234.56" or "1,234,567.89" -> comma is thousands, dot is decimal
+            s = s.replace(",", "")
+    elif has_dot and not has_comma:
+        if s.count(".") > 1:
+            # Multiple dots: "1.234.567" -> thousands
+            s = s.replace(".", "")
+        else:
+            # Single dot: e.g. "25.000" vs "12.5"
+            parts = s.split(".")
+            if len(parts) == 2 and len(parts[1]) == 3 and parts[0].isdigit():
+                # Vietnamese currency with 3 trailing decimals is thousand separator
+                s = s.replace(".", "")
+    elif has_comma and not has_dot:
+        if s.count(",") > 1:
+            # Multiple commas: "1,234,567" -> thousands
+            s = s.replace(",", "")
+        else:
+            # Single comma: "12,5" vs "1,234"
+            parts = s.split(",")
+            if len(parts) == 2 and len(parts[1]) == 3 and parts[0].isdigit():
+                s = s.replace(",", "")
+            elif len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                s = s.replace(",", ".")
+            else:
+                s = s.replace(",", "")
+
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
 def clean_number_series(s: pd.Series) -> pd.Series:
@@ -70,27 +194,45 @@ def clean_number_series(s: pd.Series) -> pd.Series:
     """
     if pd.api.types.is_numeric_dtype(s):
         return s
-    
-    # Strip whitespace and currency suffixes
-    str_s = s.astype(str).str.strip()
-    str_s = str_s.str.replace(r"(?i)\s*(?:đ|vnd|dong|%)\s*$", "", regex=True).str.strip()
-    
-    # If formatted as 1.000.000 (dots as thousands) or 1,000,000 (commas as thousands)
-    # Check if commas are used
-    has_comma = str_s.str.contains(",", regex=False)
-    has_dot = str_s.str.contains(".", regex=False)
-    
-    # Simple heuristic: remove commas first
-    cand = str_s.str.replace(",", "", regex=False)
-    num = pd.to_numeric(cand, errors="coerce")
-    
-    # For rows where numeric failed, but contains dots (e.g. 560.000)
-    failed_mask = num.isna() & has_dot & ~str_s.isin(["nan", "None", "", "null"])
-    if failed_mask.any():
-        cand2 = str_s[failed_mask].str.replace(".", "", regex=False)
-        num.loc[failed_mask] = pd.to_numeric(cand2, errors="coerce")
-        
-    return num
+    return s.apply(parse_vietnamese_number_scalar)
+
+
+def find_true_header_from_df(df: pd.DataFrame) -> Tuple[int, List[str]]:
+    """
+    Detects the true header row index: the first row with >= 3 non-empty cells.
+    """
+    for idx in range(min(15, len(df))):
+        row = df.iloc[idx]
+        non_empty = [c for c in row if pd.notna(c) and str(c).strip() != "" and str(c).lower() != "nan" and not str(c).startswith("Unnamed:")]
+        if len(non_empty) >= 3:
+            cols = [str(c).strip() if pd.notna(c) and str(c).strip() else f"col_{i}" for i, c in enumerate(row)]
+            return idx, cols
+    return 0, [str(c) for c in df.columns]
+
+
+def drop_subtotal_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Removes subtotal / 'Tổng cộng' rows from dataframe.
+    """
+    keywords = ["tổng cộng", "tong cong", "tổng", "tong", "subtotal", "total"]
+    if df.empty:
+        return df
+
+    drop_indices = []
+    for idx, row in df.iterrows():
+        is_sub = False
+        for cell in row:
+            if pd.notna(cell):
+                c_str = str(cell).strip().lower()
+                if any(c_str == k or c_str.startswith(f"{k}:") or c_str.startswith(f"{k} ") for k in keywords):
+                    is_sub = True
+                    break
+        if is_sub:
+            drop_indices.append(idx)
+
+    if drop_indices:
+        return df.drop(index=drop_indices).reset_index(drop=True)
+    return df
 
 
 def clean_date_series(s: pd.Series) -> pd.Series:
@@ -122,25 +264,36 @@ def clean_date_series(s: pd.Series) -> pd.Series:
 def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """
     Preprocesses a raw DataFrame:
-    1. Forward-fill empty grouped rows for order metadata (Rulebook Section 8).
-    2. Normalize column headers into unique snake_case ASCII identifiers.
-    3. Vectorized normalization of numbers and dates.
+    1. Removes subtotal / summary rows.
+    2. Forward-fill empty grouped rows for confirmed order metadata.
+    3. Normalize column headers into unique snake_case ASCII identifiers.
+    4. Type casting:
+       - Match candidate columns by whole words (split by '_'), NOT substring.
+       - Only cast if parsed rate >= 90%.
+       - If casting loses > 20% of non-empty values, reverts to original column.
     """
     df = df.copy()
 
-    # Rulebook Section 8: Forward-fill empty grouped rows
+    # 1. Drop subtotal rows
+    df = drop_subtotal_rows(df)
+
+    # 2. Rulebook Section 8: Forward-fill empty grouped rows (only order metadata)
+    ALLOWED_FFILL_WORDS = {"ma", "don", "so_phieu", "chung_tu", "ngay", "khach", "khach_hang", "trang_thai", "status", "tinh_trang"}
     first_col = df.columns[0]
     if len(df.columns) > 2 and df[first_col].isna().sum() > 0:
         if df[first_col].first_valid_index() is not None:
             group_cols = []
-            for col in df.columns[:5]:
-                col_lower = str(col).lower()
-                if any(k in col_lower for k in ["mã", "don", "ngày", "ngay", "khách", "khach", "trạng", "trang"]):
+            for col in df.columns[:6]:
+                col_norm = normalize_identifier(str(col))
+                words = set(col_norm.split("_"))
+                if words & {"gia", "don_gia", "tien", "thanh_tien", "so_luong"}:
+                    continue
+                if words & ALLOWED_FFILL_WORDS:
                     group_cols.append(col)
             if group_cols:
                 df[group_cols] = df[group_cols].ffill()
 
-    # Clean headers & build mapping
+    # 3. Clean headers & build mapping
     col_mapping = {}
     new_cols = []
     seen = {}
@@ -155,13 +308,33 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]
         col_mapping[norm] = str(col)
     df.columns = new_cols
 
-    # Vectorized cleaning for dates and numbers
+    # 4. Safe type cleaning for dates and numbers
+    DATE_KEYWORDS = {"ngay", "date", "thoi_gian", "ngay_lap", "ngay_ct", "ngay_dat", "ngay_ban"}
+    AMOUNT_WORDS = {
+        "gia", "don_gia", "gia_ban", "tien", "thanh_tien", "tong_tien",
+        "so_luong", "soluong", "amount", "price", "quantity", "total",
+        "no", "cong_no", "du_no", "chiet_khau", "giam_gia", "thanh_toan"
+    }
+    EXCLUDE_AMOUNT_WORDS = {"giao_hang", "noi_dung", "noi_giao", "don_vi", "ten"}
+
     for col in df.columns:
-        col_lower = col.lower()
-        if any(d in col_lower for d in ["ngay", "date", "thoi_gian"]):
+        words = set(col.lower().split("_"))
+        if words & DATE_KEYWORDS:
             df[col] = clean_date_series(df[col])
-        elif any(n in col_lower for n in ["gia", "tien", "thanh_toan", "so_luong", "soluong", "no", "tong", "chiet_khau", "giam"]):
-            df[col] = clean_number_series(df[col])
+        elif (words & AMOUNT_WORDS) and not any(ex in col.lower() for ex in EXCLUDE_AMOUNT_WORDS):
+            orig_series = df[col]
+            non_empty_mask = orig_series.notna() & (orig_series.astype(str).str.strip() != "") & (orig_series.astype(str).str.lower() != "nan")
+            num_non_empty = int(non_empty_mask.sum())
+            if num_non_empty > 0:
+                cleaned = clean_number_series(orig_series)
+                parsed_non_empty = int(cleaned[non_empty_mask].notna().sum())
+                parse_rate = parsed_non_empty / num_non_empty
+                loss_rate = (num_non_empty - parsed_non_empty) / num_non_empty
+
+                if parse_rate >= 0.90 and loss_rate <= 0.20:
+                    df[col] = cleaned
+                else:
+                    df[col] = orig_series
 
     return df, col_mapping
 
@@ -210,12 +383,16 @@ def load_business_data(business_id: str, business_dir: str) -> BusinessContext:
                 df = None
                 for enc in ["utf-8", "utf-8-sig", "latin1", "cp1258"]:
                     try:
-                        df = pd.read_csv(fpath, encoding=enc, low_memory=False)
+                        df = pd.read_csv(fpath, encoding=enc, header=None, low_memory=False)
                         break
                     except Exception:
                         continue
-                if df is not None:
-                    clean_df, col_map = preprocess_dataframe(df)
+                if df is not None and not df.empty:
+                    h_idx, cols = find_true_header_from_df(df)
+                    data_df = df.iloc[h_idx + 1:].copy()
+                    data_df.columns = cols
+                    data_df = data_df.reset_index(drop=True)
+                    clean_df, col_map = preprocess_dataframe(data_df)
                     tbl_name = f"raw_{tbl_base}"
                     con.register(f"{tbl_name}_df", clean_df)
                     con.execute(f"CREATE TABLE {tbl_name} AS SELECT * FROM {tbl_name}_df")
@@ -226,7 +403,7 @@ def load_business_data(business_id: str, business_dir: str) -> BusinessContext:
                         for col in clean_df.columns
                     ]
             except Exception as e:
-                print(f"Error loading CSV {fname}: {e}")
+                logger.error(f"Error loading CSV {fname}: {e}")
 
     # 3. Ingest Excel (.xlsx) files
     for fname in files:
@@ -240,8 +417,12 @@ def load_business_data(business_id: str, business_dir: str) -> BusinessContext:
                 sheet_dfs = []
                 for sname in sheet_names:
                     try:
-                        sdf = pd.read_excel(excel_file, sheet_name=sname)
-                        if not sdf.empty:
+                        raw_sdf = pd.read_excel(excel_file, sheet_name=sname, header=None)
+                        if not raw_sdf.empty:
+                            h_idx, cols = find_true_header_from_df(raw_sdf)
+                            sdf = raw_sdf.iloc[h_idx + 1:].copy()
+                            sdf.columns = cols
+                            sdf = sdf.reset_index(drop=True)
                             sheet_dfs.append((sname, sdf))
                     except Exception:
                         pass

@@ -5,11 +5,48 @@ USER prompt (README, raw schema, canonical views, date anchors, 4 few-shot examp
 Appends Assistant prefill "Notes:\n-".
 """
 
+import hashlib
+import logging
 import os
 from typing import Any, Dict, List, Optional
 
 from ..data_layer.ingest import BusinessContext
 from .date_resolver import DateResolution, DateResolver
+
+logger = logging.getLogger(__name__)
+
+
+def build_chat_prompt(
+    tokenizer: Optional[Any],
+    messages: List[Dict[str, str]],
+    prefill: str = "Notes:\n-",
+) -> str:
+    """
+    Standardized chat prompt builder across train, inference, and repair.
+    Applies tokenizer.apply_chat_template(messages, add_generation_prompt=True) + prefill.
+    Falls back to ChatML format if tokenizer is unavailable.
+    """
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        try:
+            formatted = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            if prefill:
+                formatted = formatted + prefill
+            return formatted
+        except Exception:
+            pass
+
+    # ChatML fallback format
+    parts = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+    parts.append(f"<|im_start|>assistant\n{prefill}" if prefill else "<|im_start|>assistant\n")
+    return "\n".join(parts)
 
 
 # 4 Curated Few-Shot Examples representing core question types:
@@ -23,7 +60,7 @@ Question: "doanh thu tháng này của quán là bao nhiêu?"
 Date Anchors: Tháng này: từ 2026-08-01 đến 2026-08-20.
 Notes:
 - [Entity & Time analysis]: Target is total sales revenue for 'tháng này' (2026-08-01 to 2026-08-20).
-- [Logic & Formulas]: Rulebook Section 1: Doanh thu only includes completed/valid orders (exclude 'huỷ' and 'trả hàng'). Sum of line item amounts (quantity * unit_price - line_discount).
+- [Logic & Formulas]: Refer to Business Rulebook for revenue definitions and status filters. Sum of valid order line amounts.
 - [Output Type]: number (integer VND).
 TYPE: number
 ```sql
@@ -38,19 +75,21 @@ Question: "doanh thu tuần này tăng hay giảm bao nhiêu % so với tuần t
 Date Anchors: Tuần này: 2026-05-11 đến 2026-05-15. Tuần trước: 2026-05-04 đến 2026-05-10.
 Notes:
 - [Entity & Time analysis]: Compare revenue of this week vs last week.
-- [Logic & Formulas]: Rulebook Section 1: Growth percentage = ((Rev_this - Rev_last) / Rev_last) * 100. If decreased, sign must be negative. Round to 2 decimal places.
+- [Logic & Formulas]: Refer to Business Rulebook for growth calculation formula: ((Rev_this - Rev_last) / Rev_last) * 100. Round to 2 decimal places.
 - [Output Type]: percent.
 TYPE: percent
 ```sql
 WITH rev_this AS (
-    SELECT COALESCE(SUM(line_amount), 0) AS val
-    FROM v_sales
-    WHERE order_date BETWEEN '2026-05-11' AND '2026-05-15' AND is_valid_sales = TRUE
+    SELECT COALESCE(SUM(thanh_tien), 0) AS val
+    FROM don_hang_chi_tiet
+    WHERE TRY_CAST(ngay AS DATE) BETWEEN '2026-05-11' AND '2026-05-15'
+      AND LOWER(trang_thai) NOT IN ('huỷ', 'trả hàng')
 ),
 rev_last AS (
-    SELECT COALESCE(SUM(line_amount), 0) AS val
-    FROM v_sales
-    WHERE order_date BETWEEN '2026-05-04' AND '2026-05-10' AND is_valid_sales = TRUE
+    SELECT COALESCE(SUM(thanh_tien), 0) AS val
+    FROM don_hang_chi_tiet
+    WHERE TRY_CAST(ngay AS DATE) BETWEEN '2026-05-04' AND '2026-05-10'
+      AND LOWER(trang_thai) NOT IN ('huỷ', 'trả hàng')
 )
 SELECT ROUND(((rev_this.val - rev_last.val) / NULLIF(rev_last.val, 0)) * 100.0, 2) AS answer
 FROM rev_this, rev_last;
@@ -61,7 +100,7 @@ Question: "top 3 món bán chạy nhất tháng 7/2026 là những món nào?"
 Date Anchors: Tháng 7/2026: 2026-07-01 đến 2026-07-31.
 Notes:
 - [Entity & Time analysis]: Top 3 best selling items in July 2026.
-- [Logic & Formulas]: Rulebook Section 3: Bán chạy ranked by total quantity in basic units (quantity_base DESC). Exclude cancelled and returned orders. Ties broken by product_id ASC.
+- [Logic & Formulas]: Refer to Business Rulebook for sales volume ranking metric (total quantity descending) and tie-breaking order (item ID ascending).
 - [Output Type]: list.
 TYPE: list
 ```sql
@@ -79,7 +118,7 @@ Question: "lợi nhuận ròng của cửa hàng trong tháng 5/2026 là bao nhi
 Date Anchors: Tháng 5/2026: 2026-05-01 đến 2026-05-31.
 Notes:
 - [Entity & Time analysis]: Question asks for 'lợi nhuận ròng' (net profit).
-- [Logic & Formulas]: Rulebook Section 5 & 7: Net profit requires gross profit minus all operating expenses. The database does not contain an expense ledger (sổ chi phí) or COGS column. Missing essential data to compute answer.
+- [Logic & Formulas]: Net profit requires operating costs or COGS data according to the Business Rulebook. The database tables do not contain cost/expense columns or tables. Missing essential data to compute answer.
 - [Output Type]: unanswerable.
 TYPE: unanswerable
 ```sql
@@ -119,11 +158,15 @@ class PromptBuilder:
 
     def get_rulebook_content(self, runtime_rulebook_path: Optional[str] = None) -> str:
         """
-        Dynamically reads rulebook.md at runtime (mandatory for competition test splits).
+        Dynamically reads rulebook.md at runtime (mandatory for competition test splits)
+        and logs its SHA1 checksum to guarantee the correct split rulebook is active.
         """
         path = runtime_rulebook_path or self.rulebook_path
         if path and os.path.exists(path):
             try:
+                with open(path, "rb") as f:
+                    sha1 = hashlib.sha1(f.read()).hexdigest()
+                logger.info(f"Loaded Runtime Rulebook from '{path}' (SHA1: {sha1})")
                 with open(path, "r", encoding="utf-8") as f:
                     return f.read()
             except Exception:

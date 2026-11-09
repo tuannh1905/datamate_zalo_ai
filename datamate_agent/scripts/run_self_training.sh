@@ -5,7 +5,7 @@
 # ===================================================================
 set -e
 
-DATASET="${DATASET:-train}"
+DATASET="${DATASET:-train_fit}"
 DRIVE_BASE_PATH="${DRIVE_BASE_PATH:-/content/drive/MyDrive/ZaloAI_DataMate}"
 LOCAL_CACHE_ROOT="${LOCAL_CACHE_ROOT:-/content/local_data}"
 
@@ -112,4 +112,9 @@ python3 -m src.training.train_qlora \
 
 echo "==================================================================="
 echo " Self-Training Loop Completed! Final Adapter saved to ${ADAPTER_ROOT}/v3"
+echo " Evaluating Final Model on Holdout Set (train_holdout)..."
+python3 scripts/run_eval.py \
+    --dataset train_holdout \
+    --adapter "${ADAPTER_ROOT}/v3" \
+    --run_inference
 echo "==================================================================="

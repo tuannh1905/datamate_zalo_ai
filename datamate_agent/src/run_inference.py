@@ -18,9 +18,9 @@ from typing import Any, Dict, List, Optional
 import yaml
 from tqdm import tqdm
 
-from .context.prompt_builder import PromptBuilder
+from .context.prompt_builder import PromptBuilder, build_chat_prompt
 from .data_layer.debt_macros import register_debt_macros
-from .data_layer.ingest import BusinessContext, load_business_data
+from .data_layer.ingest import BusinessContext, load_business_data, resolve_business_dir
 from .data_layer.view_builder import build_canonical_views
 from .inference.executor_voter import CandidateExecution, ExecutorVoter, QuestionInferenceResult
 from .inference.llm_engine import LLMEngine
@@ -40,8 +40,10 @@ def run_inference_pipeline(
     model_override: Optional[str] = None,
     adapter_override: Optional[str] = None,
     limit: Optional[int] = None,
+    allow_mock: bool = False,
 ) -> None:
     # 1. Load Configuration
+    # 1. Load Configuration & Resolve Model/Adapter Paths
     config = {}
     if config_path and os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
@@ -52,8 +54,38 @@ def run_inference_pipeline(
     thinking_k = inf_cfg.get("num_thinking_samples", 4)
     tau = inf_cfg.get("agreement_threshold_tau", 0.5)
 
-    model_path = model_override or config.get("model", {}).get("base_model_name_or_path", "Qwen/Qwen2.5-Coder-7B-Instruct")
-    adapter_path = adapter_override or config.get("model", {}).get("adapter_path", None)
+    # Resolution priority: CLI override > Env var > paths.*_dir on disk > config.model
+    paths_cfg = config.get("paths", {})
+    model_cfg = config.get("model", {})
+
+    model_source = "CLI override"
+    model_path = model_override
+    if not model_path:
+        if os.environ.get("MODEL_DIR") and os.path.exists(os.environ["MODEL_DIR"]):
+            model_path = os.environ["MODEL_DIR"]
+            model_source = "Env MODEL_DIR"
+        elif paths_cfg.get("model_dir") and os.path.exists(paths_cfg["model_dir"]):
+            model_path = paths_cfg["model_dir"]
+            model_source = f"Local paths.model_dir ({model_path})"
+        else:
+            model_path = model_cfg.get("base_model_name_or_path", "Qwen/Qwen2.5-Coder-7B-Instruct")
+            model_source = "Config base_model_name_or_path"
+
+    adapter_source = "CLI override"
+    adapter_path = adapter_override
+    if not adapter_path:
+        if os.environ.get("ADAPTER_DIR") and os.path.exists(os.environ["ADAPTER_DIR"]):
+            adapter_path = os.environ["ADAPTER_DIR"]
+            adapter_source = "Env ADAPTER_DIR"
+        elif paths_cfg.get("adapter_dir") and os.path.exists(paths_cfg["adapter_dir"]):
+            adapter_path = paths_cfg["adapter_dir"]
+            adapter_source = f"Local paths.adapter_dir ({adapter_path})"
+        else:
+            adapter_path = model_cfg.get("adapter_path", None)
+            adapter_source = "Config adapter_path"
+
+    logger.info(f"Loaded Base Model : {model_path} (Source: {model_source})")
+    logger.info(f"Loaded Adapter    : {adapter_path or 'None'} (Source: {adapter_source})")
 
     # 2. Setup Output Directories
     os.makedirs(os.path.dirname(os.path.abspath(submission_path)), exist_ok=True)
@@ -65,6 +97,12 @@ def run_inference_pipeline(
     user_prompt_file = os.path.join(base_dir, "prompts", "qa_user_template.txt")
 
     logger.info("Initializing PromptBuilder with dynamic rulebook...")
+    if rulebook_path and os.path.exists(rulebook_path):
+        import hashlib
+        with open(rulebook_path, "rb") as f:
+            rb_sha1 = hashlib.sha1(f.read()).hexdigest()
+        logger.info(f"Active Split Rulebook: '{rulebook_path}' (SHA1: {rb_sha1})")
+
     prompt_builder = PromptBuilder(
         system_template_path=sys_prompt_file,
         user_template_path=user_prompt_file,
@@ -72,10 +110,10 @@ def run_inference_pipeline(
         calendar_path=calendar_path,
     )
 
-    logger.info(f"Initializing Offline LLM Engine (Model: {model_path}, Adapter: {adapter_path})...")
     llm_engine = LLMEngine(
         model_name_or_path=model_path,
         adapter_path=adapter_path,
+        allow_mock=allow_mock,
     )
 
     # 4. Load Questions and Group by Business
@@ -101,8 +139,33 @@ def run_inference_pipeline(
     start_total_time = time.time()
 
     for b_id, q_list in biz_questions.items():
+        b_dir = resolve_business_dir(data_dir, b_id)
+        if not b_dir:
+            logger.warning(f"Business data directory for '{b_id}' not found under '{data_dir}'. Abstaining {len(q_list)} queries.")
+            for q in q_list:
+                q_id = q["id"]
+                sub_dict = {"id": q_id, "type": "abstain"}
+                submission_file.write(json.dumps(sub_dict, ensure_ascii=False) + "\n")
+                submission_file.flush()
+
+                log_path = os.path.join(log_dir, f"{q_id}.json")
+                log_data = {
+                    "id": q_id,
+                    "business_id": b_id,
+                    "final_type": "abstain",
+                    "final_answer": None,
+                    "elapsed_seconds": 0.0,
+                    "abstain_reason": f"Business directory '{b_id}' could not be resolved under '{data_dir}'",
+                    "candidates": [],
+                }
+                with open(log_path, "w", encoding="utf-8") as f_log:
+                    json.dump(log_data, f_log, ensure_ascii=False, indent=2)
+
+                total_abstain += 1
+                total_processed += 1
+            continue
+
         logger.info(f"--- Loading Business [{b_id}] ({len(q_list)} queries) ---")
-        b_dir = os.path.join(data_dir, b_id)
         ctx = load_business_data(b_id, b_dir)
 
         # Build canonical views & macros
@@ -113,6 +176,7 @@ def run_inference_pipeline(
             con=ctx.con,
             llm_engine=llm_engine,
             agreement_threshold_tau=tau,
+            schema_summary=ctx.get_schema_summary(),
         )
 
         for q in q_list:
@@ -132,8 +196,12 @@ def run_inference_pipeline(
                 runtime_rulebook_path=rulebook_path,
             )
 
-            user_content = messages[1]["content"]
-            full_prompt = f"{messages[0]['content']}\n\nUser:\n{user_content}\n\nAssistant:\nNotes:\n-"
+            # Assemble standardized chat prompt with prefill
+            full_prompt = build_chat_prompt(
+                tokenizer=llm_engine.tokenizer,
+                messages=messages,
+                prefill="Notes:\n-",
+            )
 
             # Generate initial k=8 plain samples
             plain_outputs = llm_engine.generate_single(
@@ -211,8 +279,9 @@ def run_inference_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(description="Run DataMate Offline Inference Pipeline.")
+    parser.add_argument("--list_datasets", action="store_true", help="List all datasets registered in configs/datasets.yaml")
     # Dataset routing & Drive caching parameters
-    parser.add_argument("--dataset", default=None, help="Dataset split name: train, public_test, private_test")
+    parser.add_argument("--dataset", default=None, help="Dataset split name: train, public_test, private_test, train_mini, etc.")
     parser.add_argument("--drive_base_path", default="/content/drive/MyDrive/ZaloAI_DataMate", help="Base directory on Google Drive or local filesystem")
     parser.add_argument("--local_cache_root", default="/content/local_data", help="Fast local NVMe cache directory on Colab")
     
@@ -227,22 +296,32 @@ def main():
     parser.add_argument("--model", default=None, help="Model name or path override")
     parser.add_argument("--adapter", default=None, help="Adapter path override")
     parser.add_argument("--limit", type=int, default=None, help="Limit questions for quick testing")
+    parser.add_argument("--allow_mock", action="store_true", help="Allow fallback mock LLM mode for testing/CI")
     args = parser.parse_args()
+
+    if args.list_datasets:
+        from .data_layer.dataset_registry import list_datasets
+        list_datasets()
+        return
 
     data_dir = args.data_dir
     questions_path = args.questions
     rulebook_path = args.rulebook
     calendar_path = args.calendar
 
-    # If --dataset is specified, route through dataset_loader with auto-caching
+    # If --dataset is specified, route through dataset_registry (or dataset_loader fallback)
     if args.dataset:
-        from .data_layer.dataset_loader import load_dataset
-        logger.info(f"Routing data via dataset_loader for split [{args.dataset}]...")
-        dp = load_dataset(
-            dataset=args.dataset,
-            drive_base_path=args.drive_base_path,
-            local_cache_root=args.local_cache_root,
-        )
+        try:
+            from .data_layer.dataset_registry import resolve_dataset
+            dp = resolve_dataset(args.dataset)
+        except Exception as e:
+            logger.warning(f"Dataset registry could not resolve '{args.dataset}' ({e}). Falling back to dataset_loader...")
+            from .data_layer.dataset_loader import load_dataset
+            dp = load_dataset(
+                dataset=args.dataset,
+                drive_base_path=args.drive_base_path,
+                local_cache_root=args.local_cache_root,
+            )
         data_dir = dp.data_dir
         questions_path = dp.questions_path
         rulebook_path = dp.rulebook_path
@@ -259,6 +338,7 @@ def main():
         model_override=args.model,
         adapter_override=args.adapter,
         limit=args.limit,
+        allow_mock=args.allow_mock,
     )
 
 

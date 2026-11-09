@@ -1,0 +1,43 @@
+# DataMate Dataset Registry Configuration
+# Usage: --dataset <name> (e.g. --dataset train, --dataset train_mini, --dataset public_test)
+
+defaults:
+  local_cache_root: /content/local_data
+
+datasets:
+  train:
+    root: /content/dataset_gdrive/train/train
+    data_dir: data
+    questions: questions.jsonl
+    answers: answers.jsonl
+    rulebook: rulebook.md
+    calendar: calendar.csv
+
+  public_test:
+    root: /content/dataset_gdrive/public_test/public_test
+    data_dir: data
+    questions: questions.jsonl
+    answers: null
+    rulebook: rulebook.md
+    calendar: calendar.csv
+
+  private_test:
+    root: /data
+    data_dir: data
+    questions: questions.jsonl
+    answers: null
+    rulebook: rulebook.md
+    calendar: calendar.csv
+
+  train_fit:
+    extends: train
+    exclude_business_ids: [biz_103, biz_110, biz_117, biz_124, biz_129]
+
+  train_holdout:
+    extends: train
+    include_business_ids: [biz_103, biz_110, biz_117, biz_124, biz_129]
+
+  train_mini:
+    extends: train
+    include_business_ids: [biz_101, biz_102]
+    limit: 20

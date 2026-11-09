@@ -25,7 +25,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate DataMate pipeline with dataset routing and auto-caching.")
     
     # Dataset routing arguments
-    parser.add_argument("--dataset", default=None, help="Dataset split name: train, public_test, private_test")
+    parser.add_argument("--list_datasets", action="store_true", help="List all datasets registered in configs/datasets.yaml")
+    parser.add_argument("--dataset", default=None, help="Dataset split name: train, public_test, private_test, train_mini, etc.")
     parser.add_argument("--drive_base_path", default="/content/drive/MyDrive/ZaloAI_DataMate", help="Base directory on Google Drive or local filesystem")
     parser.add_argument("--local_cache_root", default="/content/local_data", help="Fast local NVMe cache directory on Colab")
     
@@ -35,6 +36,7 @@ def main():
     
     # Inference execution options
     parser.add_argument("--run_inference", action="store_true", help="Force running inference before evaluation")
+    parser.add_argument("--allow_mock", action="store_true", help="Allow fallback mock mode for testing/CI without GPU")
     parser.add_argument("--model", default=None, help="Model name or path override")
     parser.add_argument("--adapter", default=None, help="Adapter path override")
     parser.add_argument("--config", default=None, help="Path to config.yaml")
@@ -43,20 +45,29 @@ def main():
     
     args = parser.parse_args()
 
+    if args.list_datasets:
+        from src.data_layer.dataset_registry import list_datasets
+        list_datasets()
+        return
+
     # Determine submission path
     submission_path = args.submission or os.path.abspath(os.path.join(os.path.dirname(__file__), "../result/submission.jsonl"))
     log_dir = os.path.abspath(os.path.join(os.path.dirname(submission_path), "logs"))
 
     answers_path = args.answers
 
-    # If --dataset is specified, use dataset_loader with auto-caching
+    # If --dataset is specified, route through dataset_registry (fallback to dataset_loader)
     if args.dataset:
-        logger.info(f"Loading dataset [{args.dataset}] from base path: {args.drive_base_path}")
-        dataset_paths = load_dataset(
-            dataset=args.dataset,
-            drive_base_path=args.drive_base_path,
-            local_cache_root=args.local_cache_root,
-        )
+        try:
+            from src.data_layer.dataset_registry import resolve_dataset
+            dataset_paths = resolve_dataset(args.dataset)
+        except Exception as e:
+            logger.warning(f"Dataset registry fallback to dataset_loader for '{args.dataset}': {e}")
+            dataset_paths = load_dataset(
+                dataset=args.dataset,
+                drive_base_path=args.drive_base_path,
+                local_cache_root=args.local_cache_root,
+            )
         
         if not answers_path:
             answers_path = dataset_paths.answers_path
@@ -75,6 +86,7 @@ def main():
                 model_override=args.model,
                 adapter_override=args.adapter,
                 limit=args.limit,
+                allow_mock=args.allow_mock,
             )
 
     if not os.path.exists(submission_path):
@@ -102,6 +114,14 @@ def main():
             if line:
                 item = json.loads(line)
                 gold_dict[item["id"]] = item
+
+    # P0-11: When evaluating a subset (via --limit or partial predictions), filter gold_dict by evaluated IDs
+    pred_ids = {p["id"] for p in predictions if "id" in p}
+    if args.limit or len(pred_ids) < len(gold_dict):
+        filtered_gold = {qid: gold for qid, gold in gold_dict.items() if qid in pred_ids}
+        if filtered_gold:
+            logger.info(f"P0-11: Evaluating {len(filtered_gold)} questions (filtered from total {len(gold_dict)} gold references).")
+            gold_dict = filtered_gold
 
     results = evaluate_predictions(predictions, gold_dict)
 

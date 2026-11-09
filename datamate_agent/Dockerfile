@@ -23,9 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set working directory
 WORKDIR /datamate_agent
 
-# Install Python requirements
-COPY requirements.txt /datamate_agent/
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python requirements (using docker-specific requirements to preserve pre-installed torch/vllm)
+COPY requirements-docker.txt /datamate_agent/
+RUN pip install --no-cache-dir -r requirements-docker.txt
 
 # Copy source code, configs, prompts, and scripts
 COPY configs/ /datamate_agent/configs/

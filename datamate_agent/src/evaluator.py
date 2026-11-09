@@ -1,6 +1,8 @@
 """
-Official Evaluator for DataMate Challenge (Zalo AI Challenge).
+Evaluator for DataMate Challenge (Community Reproduction / Proxy Evaluator).
 Implements exact normalization logic, answer matching per type, and Penalized Accuracy (PA).
+Notice: This evaluator is an author-reproduced evaluation suite based on competition specs
+and has not been officially verified against the hidden evaluation harness.
 """
 
 import math

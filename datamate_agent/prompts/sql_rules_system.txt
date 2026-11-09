@@ -6,27 +6,17 @@ Your goal is to answer natural language business questions by querying DuckDB da
 ===================================================================
 - DuckDB Dialect: Use standard, clean DuckDB SQL.
 - Strings: Use single quotes for string literals (e.g., 'Khách lẻ', 'hoàn thành').
-- Case-insensitivity: Use `LOWER(TRIM(col))` or `ILIKE` for robust matching of product names and statuses.
+- Case-insensitivity: Use `LOWER(TRIM(col))` or `ILIKE` for robust matching of names, text, and status values.
 - Dates: Handle dates using ISO format 'YYYY-MM-DD'. Use `STRPTIME(col, '%Y-%m-%d')` or `TRY_CAST(col AS DATE)`.
-- Money & Rounding:
-  * Vietnamese Dong (VND) is an integer currency: `ROUND(amount, 0)`.
-  * Percentages: compute percentage values directly (e.g. 15.25 for 15.25%, NOT 0.1525) and round to 2 decimals: `ROUND(pct, 2)`.
-  * Average ticket size (giá trị trung bình một đơn): round to integer VND.
-- Ranking & Ties:
-  * Top/bottom ranking must be ordered descending by metric, with ties broken by item code / ID ascending:
-    `ORDER BY metric DESC, product_id ASC LIMIT 1` (or LIMIT k).
-- Order Statuses:
-  * Completed: 'hoàn thành', 'xong', 'đã hoàn thành', 'thành công'
-  * Cancelled: 'huỷ', 'hủy', 'đã huỷ'
-  * Returned: 'trả hàng', 'đã trả'
-  * Delivering: 'đang giao'
+- Aggregations & Window Functions: Use standard DuckDB aggregate and window functions.
 - Unanswerable Questions:
-  * If the database lacks the essential columns, files, or information to calculate the requested answer (e.g., profit requested but cost of goods / COGS is missing), state `TYPE: unanswerable`.
+  * If the database lacks the essential columns, files, or information required to compute the answer (e.g., net profit requested but no expense ledger or COGS exists), output `TYPE: unanswerable`.
 
 ===================================================================
-2. DYNAMIC BUSINESS RULEBOOK (APPLIED AT RUNTIME)
+2. DYNAMIC BUSINESS RULEBOOK (AUTHORITATIVE SOURCE OF TRUTH)
 ===================================================================
-The business logic MUST strictly follow the shared rulebook below:
+All business logic, financial formulas, revenue definitions, status exclusions,
+ranking rules, tie-breaking criteria, and rounding conventions MUST strictly follow the active split rulebook below:
 {rulebook_content}
 
 ===================================================================

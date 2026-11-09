@@ -25,11 +25,10 @@ The DuckDB database contains the following tables:
 ===================================================================
 5. RULEBOOK CONSTRAINTS & HINTS
 ===================================================================
-- Revenue: Exclude cancelled ('huỷ') and returned ('trả hàng') orders. Sum of line item amount (after line discount, BEFORE order-level voucher). Do NOT deduct order voucher, do NOT include VAT/delivery fee.
-- Dates: Orders belong to a period by `order_date` (ngày đặt), not delivery/payment date.
-- Ranking: Highest/lowest ranked by metric DESC. Ties MUST be broken by product_id/item_code ASC.
-- Rounding: VND amounts round to nearest integer. Percentages round to 2 decimals.
-- Unanswerable: If the required columns/data (e.g. COGS/cost for profit) do not exist, return unanswerable.
+- The Business Rulebook provided in the system prompt is the authoritative single source of truth for all metric calculations, status filtering, date definitions, ranking ties, and rounding conventions.
+- If the required columns or tables do not exist in the database to answer the question, output TYPE: unanswerable.
+- Ensure all queries are valid DuckDB SQL syntax.
+- When canonical views (`v_sales`, `v_orders`) are available, you may query them; otherwise query raw tables directly.
 
 ===================================================================
 6. FEW-SHOT EXAMPLES (SIMILAR QUESTIONS)
@@ -43,6 +42,3 @@ Question: "{question}"
 As-of Date: {as_of_date}
 
 Please write your reasoning in Notes, then output the target TYPE and the DuckDB SQL query.
-Assistant:
-Notes:
-- 

@@ -10,19 +10,29 @@ nvidia-smi
 
 echo "=== [2/4] Installing Python Dependencies ==="
 pip install duckdb openpyxl pandas numpy pyyaml pydantic tqdm python-dateutil
-pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+pip install "huggingface-hub>=1.5.0,<2.0"
+pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git" || echo "Notice: Unsloth install failed, falling back to standard PEFT."
 pip install peft accelerate bitsandbytes datasets
 
-# Attempt vllm install if available for this Python/CUDA version
-pip install "vllm>=0.6.0" || echo "Notice: vLLM not available for this Python version, will use HuggingFace/Unsloth backend."
+# Optional vLLM installation: only if INSTALL_VLLM=1 is explicitly requested
+if [ "${INSTALL_VLLM}" = "1" ]; then
+    echo "Installing vLLM as requested (GPU >= 24GB recommended)..."
+    pip install "vllm>=0.6.0" || echo "Notice: vLLM install failed, using PyTorch/Unsloth backend."
+else
+    echo "Notice: vLLM installation skipped by default (set INSTALL_VLLM=1 to enable). Using HuggingFace/Unsloth backend."
+fi
 
 echo "=== [3/4] Downloading Base Model Weights (Offline Preparation) ==="
 MODEL_ID="Qwen/Qwen2.5-Coder-7B-Instruct"
 WEIGHTS_DIR="./weights/base_model"
 mkdir -p "${WEIGHTS_DIR}"
 
-pip install -U "huggingface_hub[cli]"
-huggingface-cli download "${MODEL_ID}" --local-dir "${WEIGHTS_DIR}" --local-dir-use-symlinks False
+python3 -c "
+from huggingface_hub import snapshot_download
+print(f'Downloading model weights from {MODEL_ID} to {WEIGHTS_DIR}...')
+snapshot_download(repo_id='${MODEL_ID}', local_dir='${WEIGHTS_DIR}', local_dir_use_symlinks=False)
+print('Model weights downloaded successfully.')
+"
 
 echo "=== [4/4] Verifying Environment ==="
 python3 -c "

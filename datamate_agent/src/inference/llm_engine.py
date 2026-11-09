@@ -37,10 +37,12 @@ class LLMEngine:
         quantization: Optional[str] = None,
         trust_remote_code: bool = True,
         enforce_eager: bool = False,
+        allow_mock: bool = False,
     ):
         self.model_name_or_path = model_name_or_path
         self.adapter_path = adapter_path
         self.max_model_len = max_model_len
+        self.allow_mock = allow_mock
         self.llm = None
         self.lora_request = None
         self.is_offline_vllm = False
@@ -81,20 +83,37 @@ class LLMEngine:
         # 2. If vLLM is not active but CUDA is available, use HuggingFace Transformers
         if not self.is_offline_vllm and HAS_CUDA and (os.path.exists(model_name_or_path) or "/" in model_name_or_path):
             try:
-                from transformers import AutoModelForCausalLM, AutoTokenizer
+                from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
                 logger.info(f"Loading Hugging Face model on GPU: {model_name_or_path}")
                 self.hf_tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+                
+                is_ampere_or_later = False
+                if torch.cuda.is_available():
+                    try:
+                        major, _ = torch.cuda.get_device_capability()
+                        is_ampere_or_later = (major >= 8)
+                    except Exception:
+                        pass
+                compute_dtype = torch.bfloat16 if is_ampere_or_later else torch.float16
+
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=compute_dtype,
+                    bnb_4bit_use_double_quant=True,
+                )
                 try:
                     self.hf_model = AutoModelForCausalLM.from_pretrained(
                         model_name_or_path,
-                        load_in_4bit=True,
+                        quantization_config=bnb_config,
                         device_map="auto",
                         trust_remote_code=trust_remote_code,
                     )
-                except Exception:
+                except Exception as bnb_err:
+                    logger.warning(f"BitsAndBytes 4-bit load failed ({bnb_err}). Falling back to native float precision...")
                     self.hf_model = AutoModelForCausalLM.from_pretrained(
                         model_name_or_path,
-                        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                        torch_dtype=compute_dtype,
                         device_map="auto",
                         trust_remote_code=trust_remote_code,
                     )
@@ -110,7 +129,23 @@ class LLMEngine:
                 self.is_hf_gpu = False
 
         if not self.is_offline_vllm and not self.is_hf_gpu:
-            logger.info("Running in Fallback Mock Mode (no GPU model loaded).")
+            if not self.allow_mock:
+                raise RuntimeError(
+                    f"[LLMEngine Error] Failed to load offline LLM model from '{model_name_or_path}' (adapter: '{adapter_path}'). "
+                    f"To enable Fallback Mock Mode for testing/CI, pass '--allow_mock' or allow_mock=True."
+                )
+            logger.warning("Running in Fallback Mock Mode (--allow_mock enabled).")
+
+    @property
+    def tokenizer(self) -> Optional[Any]:
+        if self.is_offline_vllm and self.llm is not None:
+            try:
+                return self.llm.get_tokenizer()
+            except Exception:
+                pass
+        if self.is_hf_gpu and self.hf_tokenizer is not None:
+            return self.hf_tokenizer
+        return None
 
     def generate_batch(
         self,
@@ -129,7 +164,7 @@ class LLMEngine:
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=max_new_tokens,
-                stop=stop_tokens or ["```\n\n", "User:", "<|im_end|>"],
+                stop=stop_tokens or ["<|im_end|>"],
             )
             outputs = self.llm.generate(
                 prompts,
@@ -188,7 +223,7 @@ class LLMEngine:
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=max_new_tokens,
-                stop=["```\n\n", "<|im_end|>"],
+                stop=["<|im_end|>"],
             )
             outputs = self.llm.generate(
                 [prompt],
@@ -198,21 +233,25 @@ class LLMEngine:
             return [out.text for out in outputs[0].outputs]
 
         if self.is_hf_gpu and self.hf_model is not None and self.hf_tokenizer is not None:
-            results = []
             inputs = self.hf_tokenizer(prompt, return_tensors="pt").to(self.hf_model.device)
             do_sample = temperature > 0.0
-            for _ in range(n):
-                gen_kwargs: Dict[str, Any] = {
-                    "max_new_tokens": max_new_tokens,
-                    "do_sample": do_sample,
-                    "pad_token_id": self.hf_tokenizer.eos_token_id,
-                }
-                if do_sample:
-                    gen_kwargs["temperature"] = temperature
-                    gen_kwargs["top_p"] = top_p
-                with torch.no_grad():
-                    gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
-                out_text = self.hf_tokenizer.decode(gen_tokens[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            gen_kwargs: Dict[str, Any] = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": do_sample,
+                "pad_token_id": self.hf_tokenizer.eos_token_id,
+            }
+            if do_sample:
+                gen_kwargs["temperature"] = temperature
+                gen_kwargs["top_p"] = top_p
+                if n > 1:
+                    gen_kwargs["num_return_sequences"] = n
+            with torch.no_grad():
+                gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
+            
+            results = []
+            prompt_len = inputs["input_ids"].shape[1]
+            for seq in gen_tokens:
+                out_text = self.hf_tokenizer.decode(seq[prompt_len:], skip_special_tokens=True)
                 results.append(out_text)
             return results
 

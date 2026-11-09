@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from tqdm import tqdm
 
-from ..context.prompt_builder import PromptBuilder
+from ..context.prompt_builder import PromptBuilder, build_chat_prompt
 from ..data_layer.debt_macros import register_debt_macros
 from ..data_layer.ingest import BusinessContext, load_business_data
 from ..data_layer.view_builder import build_canonical_views
@@ -80,25 +80,29 @@ def generate_training_candidates(
         if b_id not in biz_cache:
             b_dir = os.path.join(data_dir, b_id)
             ctx = load_business_data(b_id, b_dir)
-            build_canonical_views(ctx, k=8)
-            register_debt_macros(ctx, plausibility_check=True)
-            biz_cache[b_id] = ctx
+            view_res = build_canonical_views(ctx, k=8)
+            debt_status = register_debt_macros(ctx, plausibility_check=True)
+            biz_cache[b_id] = (ctx, view_res, debt_status)
         else:
-            ctx = biz_cache[b_id]
+            ctx, view_res, debt_status = biz_cache[b_id]
 
         # Build prompt
         messages = prompt_builder.build_messages(
             question=question_text,
             as_of_date=as_of_date,
             ctx=ctx,
-            canonical_sales_sql="v_sales",
-            canonical_orders_sql="v_orders",
-            has_debt_macros=True,
+            canonical_sales_sql=view_res.v_sales_sql if view_res.success else None,
+            canonical_orders_sql=view_res.v_orders_sql if view_res.success else None,
+            has_debt_macros=debt_status.registered,
             runtime_rulebook_path=rulebook_path,
         )
 
         user_content = messages[1]["content"]
-        full_prompt = f"{messages[0]['content']}\n\nUser:\n{user_content}\n\nAssistant:\nNotes:\n-"
+        full_prompt = build_chat_prompt(
+            tokenizer=llm_engine.tokenizer,
+            messages=messages,
+            prefill="Notes:\n-",
+        )
 
         # 1. Generate 8 plain samples (temp 0.1)
         plain_completions = llm_engine.generate_single(

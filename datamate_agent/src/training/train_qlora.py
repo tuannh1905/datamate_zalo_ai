@@ -170,30 +170,76 @@ def train_qlora(
         response_template = "Notes:\n-"
         collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer)
 
-        training_args = TrainingArguments(
-            output_dir="./training_checkpoints",
-            per_device_train_batch_size=per_device_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=learning_rate,
-            num_train_epochs=num_train_epochs,
-            logging_steps=10,
-            fp16=not torch.cuda.is_bf16_supported(),
-            bf16=torch.cuda.is_bf16_supported(),
-            optim="adamw_bnb_8bit",
-            lr_scheduler_type="cosine",
-            seed=42,
-            report_to="none",
-        )
+        # Check token lengths of training samples to prevent truncated SQL responses
+        truncated_count = 0
+        for sample_text in dataset["text"]:
+            tok_ids = tokenizer(sample_text, truncation=False)["input_ids"]
+            if len(tok_ids) > max_seq_length:
+                truncated_count += 1
+        if truncated_count > 0:
+            logger.warning(
+                f"[Token Truncation Warning] {truncated_count}/{len(dataset)} SFT samples exceed "
+                f"max_seq_length={max_seq_length}! Responses may be cut off."
+            )
 
-        trainer = SFTTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=dataset,
-            dataset_text_field="text",
-            max_seq_length=max_seq_length,
-            data_collator=collator,
-            args=training_args,
-        )
+        # Use modern SFTConfig if available in TRL, otherwise fallback to TrainingArguments
+        try:
+            from trl import SFTConfig
+            has_sft_config = True
+        except ImportError:
+            has_sft_config = False
+
+        is_bf16 = torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
+        optim_name = "adamw_bnb_8bit" if torch.cuda.is_available() else "adamw_torch"
+
+        if has_sft_config:
+            training_args = SFTConfig(
+                output_dir="./training_checkpoints",
+                dataset_text_field="text",
+                max_seq_length=max_seq_length,
+                packing=False,
+                per_device_train_batch_size=per_device_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                learning_rate=learning_rate,
+                num_train_epochs=num_train_epochs,
+                logging_steps=10,
+                fp16=not is_bf16 if torch.cuda.is_available() else False,
+                bf16=is_bf16,
+                optim=optim_name,
+                lr_scheduler_type="cosine",
+                seed=42,
+                report_to="none",
+            )
+            trainer = SFTTrainer(
+                model=model,
+                train_dataset=dataset,
+                data_collator=collator,
+                args=training_args,
+            )
+        else:
+            training_args = TrainingArguments(
+                output_dir="./training_checkpoints",
+                per_device_train_batch_size=per_device_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                learning_rate=learning_rate,
+                num_train_epochs=num_train_epochs,
+                logging_steps=10,
+                fp16=not is_bf16 if torch.cuda.is_available() else False,
+                bf16=is_bf16,
+                optim=optim_name,
+                lr_scheduler_type="cosine",
+                seed=42,
+                report_to="none",
+            )
+            trainer = SFTTrainer(
+                model=model,
+                tokenizer=tokenizer,
+                train_dataset=dataset,
+                dataset_text_field="text",
+                max_seq_length=max_seq_length,
+                data_collator=collator,
+                args=training_args,
+            )
 
         trainer.train()
 
