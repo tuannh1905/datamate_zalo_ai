@@ -744,7 +744,32 @@ def build_canonical_views(
     """
     Executes the view drafting, testing, self-repair, sanity checks, and voting pipeline
     for both sales views (`v_sales`, `v_orders`) and purchase view (`v_purchases`).
+    Checks if valid cached views already exist in ctx or DuckDB to skip redundant LLM view drafting.
     """
+    # 0. Check if valid canonical views already exist in cache
+    if getattr(ctx, "canonical_views", None) and ctx.canonical_views.get("success"):
+        return ViewBuildResult(
+            success=True,
+            v_sales_sql=ctx.canonical_views.get("v_sales_sql"),
+            v_orders_sql=ctx.canonical_views.get("v_orders_sql"),
+            v_purchases_sql=ctx.canonical_views.get("v_purchases_sql"),
+            fingerprint="cached",
+        )
+
+    try:
+        ctx.con.execute("SELECT 1 FROM v_sales LIMIT 1")
+        ctx.con.execute("SELECT 1 FROM v_orders LIMIT 1")
+        logger.info(f"Canonical views v_sales and v_orders already exist in database for {ctx.business_id}. Skipping re-drafting.")
+        return ViewBuildResult(
+            success=True,
+            v_sales_sql=ctx.canonical_views.get("v_sales_sql") if getattr(ctx, "canonical_views", None) else None,
+            v_orders_sql=ctx.canonical_views.get("v_orders_sql") if getattr(ctx, "canonical_views", None) else None,
+            v_purchases_sql=ctx.canonical_views.get("v_purchases_sql") if getattr(ctx, "canonical_views", None) else None,
+            fingerprint="cached",
+        )
+    except Exception:
+        pass
+
     # ------------------ Part 1: Sales Views ------------------
     sales_candidates: List[Tuple[str, str]] = []
     if llm_generator is not None:

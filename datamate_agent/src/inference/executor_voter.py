@@ -1,11 +1,12 @@
 """
 Execution and Majority Voting Engine for DataMate Challenge.
-Executes generated SQL queries in DuckDB with timeout,
+Executes generated SQL queries in DuckDB with strict 5.0s timeout,
 handles automated self-repair turns on errors,
 triggers +4 thinking samples on low agreement,
-and majority votes using normalized keys (outputting 'abstain' if share < tau=0.5).
+and majority votes using canonical voting keys (outputting 'abstain' if share < tau=0.5).
 """
 
+import concurrent.futures
 import json
 import logging
 import math
@@ -18,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import duckdb
 
-from ..evaluator import normalize_string
+from ..evaluator import canonicalize_for_voting, normalize_string
 from .llm_engine import LLMEngine
 
 logger = logging.getLogger(__name__)
@@ -67,58 +68,69 @@ def validate_submission_item(item: Dict[str, Any]) -> bool:
 def parse_completion(text: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Extracts TYPE and SQL query from LLM completion.
-    - Matches the LAST occurrence of TYPE: at start of a line.
+    - Case-insensitively extracts TYPE: (number|percent|string|date|boolean|list|table|unanswerable|abstain).
     - If no TYPE is found, returns (None, sql) to fail the sample.
-    - Supports closed and unclosed ```sql blocks, CTEs (WITH), and SELECT.
+    - If TYPE is unanswerable, returns ('unanswerable', None).
+    - Extracts SQL from ```sql ... ```, ``` ... ```, or fallback to the last WITH/SELECT statement.
     """
     if not text or not isinstance(text, str):
         return None, None
 
-    # 1. Extract TYPE: find all occurrences of TYPE: at start of lines, allowing markdown bolding
-    type_matches = list(re.finditer(r"(?im)^\s*(?:\*\*)?(?:\[)?TYPE(?:\])?(?::(?:\*\*)?|(?:\*\*)?:)\s*([a-zA-Z_]+)", text))
+    # 1. Case-insensitive extraction of TYPE
+    type_matches = list(re.finditer(
+        r"(?im)^\s*(?:\*\*)?(?:\[)?TYPE(?:\])?(?::(?:\*\*)?|(?:\*\*)?:)?\s*([a-zA-Z_]+)",
+        text
+    ))
+    if not type_matches:
+        # Also try inline TYPE:
+        type_matches = list(re.finditer(r"(?i)\bTYPE:\s*([a-zA-Z_]+)", text))
+
     pred_type: Optional[str] = None
     type_pos = -1
-    if type_matches:
-        last_match = type_matches[-1]
-        raw_type = last_match.group(1).lower().strip()
-        if raw_type in ["number", "percent", "string", "date", "boolean", "list", "table", "unanswerable", "abstain"]:
-            pred_type = raw_type
-            type_pos = last_match.end()
+    valid_types = ["number", "percent", "string", "date", "boolean", "list", "table", "unanswerable", "abstain"]
 
-    # 2. Extract SQL block: search after the last TYPE line first, or entire text if not found
+    if type_matches:
+        for m in reversed(type_matches):
+            raw_t = m.group(1).lower().strip()
+            if raw_t in valid_types:
+                pred_type = raw_t
+                type_pos = m.end()
+                break
+
+    if not pred_type:
+        return None, None
+
+    if pred_type == "unanswerable":
+        return "unanswerable", None
+
+    # 2. Extract SQL query
     search_region = text[type_pos:] if type_pos >= 0 else text
-    sql: Optional[str] = None
 
     def _extract_sql_from_region(region: str) -> Optional[str]:
-        # Check for closed ```sql ... ```
+        # Closed code blocks: ```sql ... ``` or ``` ... ```
         closed_blocks = list(re.finditer(r"```(?:sql)?\s*([\s\S]*?)\s*```", region, re.IGNORECASE))
         if closed_blocks:
-            for blk in closed_blocks:
+            for blk in reversed(closed_blocks):
                 cand = blk.group(1).strip()
                 if re.search(r"(?i)^\s*(?:WITH|SELECT)\b", cand):
                     return cand
-            return closed_blocks[0].group(1).strip()
+            return closed_blocks[-1].group(1).strip()
 
-        # Check for unclosed ```sql ... to end of text
+        # Unclosed code block: ```sql ... to end of region
         unclosed_match = re.search(r"```(?:sql)?\s*([\s\S]+)$", region, re.IGNORECASE)
         if unclosed_match:
             cand = unclosed_match.group(1).strip()
             cand = re.sub(r"```.*$", "", cand).strip()
             return cand
 
-        # Fallback to first WITH or SELECT query
-        with_match = re.search(r"(?is)\b(WITH\b[\s\S]+)", region)
-        select_match = re.search(r"(?is)\b(SELECT\b[\s\S]+)", region)
-        if with_match and select_match:
-            return with_match.group(1).strip() if with_match.start() < select_match.start() else select_match.group(1).strip()
-        elif with_match:
-            return with_match.group(1).strip()
-        elif select_match:
-            return select_match.group(1).strip()
+        # Fallback to finding the last WITH or SELECT statement up to ; or end of string
+        statements = list(re.finditer(r"(?is)\b(WITH\b[\s\S]+?|SELECT\b[\s\S]+?)(?:;|\Z)", region))
+        if statements:
+            return statements[-1].group(1).strip()
+
         return None
 
     sql = _extract_sql_from_region(search_region)
-    # If no SQL found after TYPE line, search the whole text
     if not sql and type_pos >= 0:
         sql = _extract_sql_from_region(text)
 
@@ -130,130 +142,24 @@ def parse_completion(text: str) -> Tuple[Optional[str], Optional[str]]:
 
 def cast_duckdb_result(result_rows: List[Tuple], pred_type: str, col_names: List[str], sql: str = "") -> Any:
     """
-    Converts raw DuckDB cursor fetch result into canonical competition types.
+    Coerces raw DuckDB cursor rows to canonical Python types via canonicalize_for_voting.
     Returns None if result is empty or NULL (unless valid 0 from COUNT).
     """
     if not result_rows:
-        # Check if query has COUNT aggregation where 0 rows might be 0
         if pred_type == "number" and re.search(r"(?i)\bCOUNT\b", sql):
             return 0
         return None
 
-    if pred_type == "unanswerable":
-        return None
-
-    # Scalar types (1 row, 1 col)
-    if pred_type in ["number", "percent", "string", "date", "boolean"]:
-        val = result_rows[0][0]
-        if val is None:
-            return None
-
-        if pred_type == "number":
-            try:
-                f = float(val)
-                if math.isnan(f):
-                    return None
-                return int(round(f)) if math.isclose(f, round(f), abs_tol=1e-5) else round(f, 2)
-            except Exception:
-                return None
-
-        elif pred_type == "percent":
-            try:
-                f = float(val)
-                if math.isnan(f):
-                    return None
-                return round(f, 2)
-            except Exception:
-                return None
-
-        elif pred_type == "string":
-            s = str(val).strip()
-            return s if s and s.lower() != "none" else None
-
-        elif pred_type == "date":
-            s = str(val).strip()
-            if len(s) >= 10 and s[4] == "-" and s[7] == "-":
-                return s[:10]
-            elif len(s) >= 7 and s[4] == "-":
-                return s[:7]
-            return s if s else None
-
-        elif pred_type == "boolean":
-            if isinstance(val, bool):
-                return val
-            s = str(val).lower().strip()
-            return s in ["true", "1", "t", "dung", "co"]
-
-    # List type
-    elif pred_type == "list":
-        res_list = []
-        for r in result_rows:
-            item = r[0] if len(r) > 0 else None
-            if item is None:
-                continue
-            if isinstance(item, (int, float)):
-                if not math.isnan(item):
-                    res_list.append(int(item) if math.isclose(item, round(item), abs_tol=1e-5) else round(item, 2))
-            else:
-                s = str(item).strip()
-                if s:
-                    res_list.append(s)
-        return res_list if res_list else None
-
-    # Table type
-    elif pred_type == "table":
-        rows = []
-        for r in result_rows:
-            row_items = []
-            for cell in r:
-                if isinstance(cell, (int, float)):
-                    row_items.append(int(cell) if math.isclose(cell, round(cell), abs_tol=1e-5) else round(cell, 2))
-                else:
-                    row_items.append(str(cell).strip() if cell is not None else "")
-            rows.append(row_items)
-        return {"columns": col_names, "rows": rows} if rows else None
-
-    return result_rows[0][0]
+    clean_val, _ = canonicalize_for_voting(pred_type, result_rows)
+    return clean_val
 
 
 def make_vote_key(pred_type: str, value: Any) -> Optional[str]:
     """
-    Converts a normalized prediction into a deterministic typed voting key.
-    Returns None if value is None and pred_type is not unanswerable.
+    Computes canonical voting key via canonicalize_for_voting.
     """
-    if pred_type == "unanswerable":
-        return "unanswerable:__null__"
-    if value is None:
-        return None
-
-    if pred_type == "number":
-        try:
-            return f"num:{float(value):.2f}"
-        except Exception:
-            return f"num:{value}"
-    elif pred_type == "percent":
-        try:
-            return f"pct:{float(value):.2f}"
-        except Exception:
-            return f"pct:{value}"
-    elif pred_type == "string":
-        return f"str:{normalize_string(value)}"
-    elif pred_type == "date":
-        return f"date:{str(value).strip().lower()}"
-    elif pred_type == "boolean":
-        return f"bool:{bool(value)}"
-    elif pred_type == "list":
-        if isinstance(value, list) and value:
-            items_str = "|".join(normalize_string(v) if isinstance(v, str) else str(v) for v in value)
-            return f"list:{items_str}"
-        return None
-    elif pred_type == "table":
-        if isinstance(value, dict) and value.get("rows"):
-            rows = value.get("rows", [])
-            rows_str = sorted(["|".join(normalize_string(c) if isinstance(c, str) else str(c) for c in r) for r in rows])
-            return f"table:{'#'.join(rows_str)}"
-        return None
-    return f"{pred_type}:{value}"
+    _, key = canonicalize_for_voting(pred_type, value)
+    return key
 
 
 @dataclass
@@ -269,6 +175,7 @@ class CandidateExecution:
     error: Optional[str] = None
     failure_category: Optional[str] = None
     repair_turns: int = 0
+    is_thinking: bool = False
 
 
 @dataclass
@@ -308,7 +215,7 @@ class QuestionInferenceResult:
 
     def to_log_dict(self) -> Dict[str, Any]:
         """
-        Formats per-question log object for `/result/logs/<id>.json`.
+        Formats per-question log object for /result/logs/<id>.json.
         """
         return {
             "id": self.question_id,
@@ -331,6 +238,7 @@ class QuestionInferenceResult:
                     "error": c.error,
                     "failure_category": c.failure_category,
                     "repair_turns": c.repair_turns,
+                    "is_thinking": c.is_thinking,
                 }
                 for c in self.candidates
             ],
@@ -342,9 +250,9 @@ class ExecutorVoter:
     def __init__(
         self,
         con: duckdb.DuckDBPyConnection,
-        llm_engine: LLMEngine,
+        llm_engine: Optional[LLMEngine] = None,
         agreement_threshold_tau: float = 0.5,
-        sql_timeout_seconds: float = 10.0,
+        sql_timeout_seconds: float = 5.0,  # Strict 5.0-second timeout
         max_repair_turns: int = 2,
         schema_summary: Optional[str] = None,
     ):
@@ -355,143 +263,121 @@ class ExecutorVoter:
         self.max_repairs = max_repair_turns
         self.schema_summary = schema_summary
 
+    def _execute_query_internal(self, sql: str) -> Tuple[bool, Any, Optional[str], List[str]]:
+        """
+        Internal execution helper with regex self-healing.
+        """
+        curr_sql = sql
+        rel = None
+        err_last = None
+
+        for attempt in range(3):
+            try:
+                rel = self.con.execute(curr_sql)
+                err_last = None
+                break
+            except Exception as ex:
+                err_last = str(ex)
+
+                # Self-healing 1: DuckDB table suggestion
+                m_tbl = re.search(r'Table with name ([a-zA-Z0-9_]+) does not exist!\s*Did you mean "([^"]+)"\?', err_last)
+                if m_tbl:
+                    w_tbl, r_tbl = m_tbl.group(1), m_tbl.group(2)
+                    curr_sql = re.sub(r'\b' + re.escape(w_tbl) + r'\b', r_tbl, curr_sql, flags=re.IGNORECASE)
+                    continue
+
+                # Self-healing 2: DuckDB column suggestion
+                m_col = re.search(r'(?:Column with name|Referenced column) "([a-zA-Z0-9_]+)" not found.*Did you mean "([^"]+)"\?', err_last)
+                if m_col:
+                    w_col, r_col = m_col.group(1), m_col.group(2)
+                    curr_sql = re.sub(r'\b' + re.escape(w_col) + r'\b', r_col, curr_sql, flags=re.IGNORECASE)
+                    continue
+
+                # Self-healing 3: LOWER() on non-VARCHAR type
+                if "no function matches the given name and argument types 'lower(" in err_last.lower():
+                    new_sql = re.sub(r'(?i)\blower\s*\(\s*([^()]+?)\s*\)', r'LOWER(CAST(\1 AS VARCHAR))', curr_sql)
+                    if new_sql != curr_sql:
+                        curr_sql = new_sql
+                        continue
+
+                break
+
+        if err_last is not None:
+            return False, None, err_last, []
+
+        col_names = [desc[0] for desc in rel.description] if rel.description else []
+        rows = rel.fetchall()
+
+        # Self-healing 4: If status equality '=' returned empty result or [(0,)], try ILIKE
+        if (not rows or rows == [(0,)] or rows == [(None,)]) and re.search(r"(?i)\b(?:trang_thai|status|tinh_trang)\s*=\s*'([^']*)'", curr_sql):
+            alt_sql = re.sub(r"(?i)\b(trang_thai|status|tinh_trang)\s*=\s*'([^']*)'", r"\1 ILIKE '%\2%'", curr_sql)
+            if alt_sql != curr_sql:
+                try:
+                    alt_rel = self.con.execute(alt_sql)
+                    alt_rows = alt_rel.fetchall()
+                    if alt_rows and alt_rows != [(0,)] and alt_rows != [(None,)]:
+                        return True, alt_rows, None, col_names
+                except Exception:
+                    pass
+
+        return True, rows, None, col_names
+
     def execute_single_sql(self, sql: str, pred_type: Optional[str]) -> Tuple[bool, Any, Optional[str], List[str]]:
         """
-        Executes a SQL query in DuckDB with safety and timeout.
+        Executes a SQL query in DuckDB with safety and strict 5.0-second timeout.
+        Rejects queries containing destructive keywords (DROP, DELETE, UPDATE, INSERT, ALTER, COPY).
         Returns (success, result_rows, error_message, column_names).
         """
         if not sql or not sql.strip():
             return False, None, "Empty SQL query", []
 
-        # Strip comments and stray markdown code fences
+        # Strip comments and code fences
         cleaned_sql = re.sub(r"```(?:sql)?", "", sql, flags=re.IGNORECASE)
         cleaned_sql = re.sub(r"```", "", cleaned_sql)
         cleaned_sql = re.sub(r"--[^\n]*", "", cleaned_sql)
         cleaned_sql = re.sub(r"/\*[\s\S]*?\*/", "", cleaned_sql).strip()
         cleaned_sql = cleaned_sql.rstrip(";")
 
-        # P0-9: Query must start with SELECT or WITH (no blind substring keyword blocking)
+        # Must start with SELECT or WITH
         if not re.match(r"(?i)^\s*(?:SELECT|WITH)\b", cleaned_sql):
             return False, None, "Query must start with SELECT or WITH statement", []
 
-        timer = None
-        timed_out = [False]
+        # Rejection of destructive keywords
+        DESTRUCTIVE_PATTERN = re.compile(r"(?i)\b(DROP|DELETE|UPDATE|INSERT|ALTER|COPY)\b")
+        if DESTRUCTIVE_PATTERN.search(cleaned_sql):
+            return False, None, "Destructive SQL operation rejected", []
 
-        def on_timeout():
-            timed_out[0] = True
-            try:
-                self.con.interrupt()
-            except Exception:
-                pass
-
+        # ThreadPoolExecutor execution with timeout and conn.interrupt()
         try:
-            if self.timeout and self.timeout > 0:
-                timer = threading.Timer(self.timeout, on_timeout)
-                timer.daemon = True
-                timer.start()
-
-            curr_sql = cleaned_sql
-            rel = None
-            err_last = None
-
-            # Deterministic self-healing retry loop (resolves table/column suggestions and function casts)
-            for attempt in range(3):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self._execute_query_internal, cleaned_sql)
                 try:
-                    rel = self.con.execute(curr_sql)
-                    err_last = None
-                    break
-                except Exception as ex:
-                    err_last = str(ex)
-                    if timed_out[0]:
-                        break
-
-                    # Self-healing 1: DuckDB table suggestion (Did you mean "xyz"?)
-                    m_tbl = re.search(r'Table with name ([a-zA-Z0-9_]+) does not exist!\s*Did you mean "([^"]+)"\?', err_last)
-                    if m_tbl:
-                        w_tbl, r_tbl = m_tbl.group(1), m_tbl.group(2)
-                        curr_sql = re.sub(r'\b' + re.escape(w_tbl) + r'\b', r_tbl, curr_sql, flags=re.IGNORECASE)
-                        continue
-
-                    # Self-healing 2: DuckDB column suggestion (Did you mean "xyz"?)
-                    m_col = re.search(r'(?:Column with name|Referenced column) "([a-zA-Z0-9_]+)" not found.*Did you mean "([^"]+)"\?', err_last)
-                    if m_col:
-                        w_col, r_col = m_col.group(1), m_col.group(2)
-                        curr_sql = re.sub(r'\b' + re.escape(w_col) + r'\b', r_col, curr_sql, flags=re.IGNORECASE)
-                        continue
-
-                    # Self-healing 3: LOWER() on non-VARCHAR type (Binder Error: lower(INTEGER/DOUBLE))
-                    if "no function matches the given name and argument types 'lower(" in err_last.lower():
-                        new_sql = re.sub(r'(?i)\blower\s*\(\s*([^()]+?)\s*\)', r'LOWER(CAST(\1 AS VARCHAR))', curr_sql)
-                        if new_sql != curr_sql:
-                            curr_sql = new_sql
-                            continue
-
-                    # Self-healing 4: Fuzzy table match when table missing but similar table exists
-                    m_tbl_no_sugg = re.search(r'Table with name ([a-zA-Z0-9_]+) does not exist!', err_last)
-                    if m_tbl_no_sugg:
-                        w_tbl = m_tbl_no_sugg.group(1)
-                        try:
-                            all_tables = [t[0] for t in self.con.execute("SHOW TABLES").fetchall()]
-                            # Find best matching table by key parts
-                            w_norm = normalize_identifier(w_tbl)
-                            candidates = [t for t in all_tables if w_norm in t or t in w_norm]
-                            if candidates:
-                                best_tbl = max(candidates, key=lambda t: len(set(w_norm.split('_')) & set(t.split('_'))))
-                                curr_sql = re.sub(r'\b' + re.escape(w_tbl) + r'\b', best_tbl, curr_sql, flags=re.IGNORECASE)
-                                continue
-                        except Exception:
-                            pass
-
-                    break
-
-            if err_last is not None:
-                if timed_out[0]:
-                    return False, None, f"SQL query timed out after {self.timeout}s (interrupted)", []
-                return False, None, err_last, []
-
-            col_names = [desc[0] for desc in rel.description] if rel.description else []
-            rows = rel.fetchall()
-
-            # Self-healing 5: If status equality '=' returned empty result or [(0,)], try ILIKE
-            # In Vietnamese retail systems, status often has prefix 'Đã ' ('Đã hoàn thành', 'Đã hủy').
-            if (not rows or rows == [(0,)] or rows == [(None,)]) and re.search(r"(?i)\b(?:trang_thai|status|tinh_trang)\s*=\s*'([^']*)'", curr_sql):
-                alt_sql = re.sub(r"(?i)\b(trang_thai|status|tinh_trang)\s*=\s*'([^']*)'", r"\1 ILIKE '%\2%'", curr_sql)
-                if alt_sql != curr_sql:
+                    return future.result(timeout=self.timeout)
+                except concurrent.futures.TimeoutError:
                     try:
-                        alt_rel = self.con.execute(alt_sql)
-                        alt_rows = alt_rel.fetchall()
-                        if alt_rows and alt_rows != [(0,)] and alt_rows != [(None,)]:
-                            return True, alt_rows, None, col_names
+                        self.con.interrupt()
                     except Exception:
                         pass
-
-            return True, rows, None, col_names
+                    return False, None, f"SQL query timed out after {self.timeout}s (interrupted)", []
         except Exception as e:
-            if timed_out[0]:
-                return False, None, f"SQL query timed out after {self.timeout}s (interrupted)", []
             return False, None, str(e), []
-        finally:
-            if timer is not None:
-                timer.cancel()
 
     def repair_sql_turn(self, bad_sql: str, error_msg: str, orig_question: str) -> Optional[str]:
         """
-        P1-15: Requests the LLM to fix a failed SQL statement given DuckDB error message,
-        compact database schema context, and formatted via build_chat_prompt.
+        Requests the LLM to fix a failed SQL statement given DuckDB error message
+        and database table column names.
         """
         if not self.llm_engine:
             return None
 
         from ..context.prompt_builder import build_chat_prompt
         compact_schema = self.schema_summary or ""
-        
-        # Check if DuckDB gave a table suggestion: e.g. Did you mean "xyz"?
+
         hint = ""
         m_sugg = re.search(r'Did you mean "([^"]+)"\?', error_msg)
         if m_sugg:
-            hint = f"\nHint from DuckDB: Did you mean table '{m_sugg.group(1)}'?"
+            hint = f"\nHint from DuckDB: Did you mean table/column '{m_sugg.group(1)}'?"
 
-        # Check if DuckDB said a column is not found in FROM clause
         m_col = re.search(r'Referenced column "([^"]+)" not found in FROM clause!', error_msg)
         if m_col and self.con:
             missing_col = m_col.group(1)
@@ -562,10 +448,11 @@ class ExecutorVoter:
         sample_id: int,
         raw_completion: str,
         orig_question: str,
+        is_thinking: bool = False,
     ) -> CandidateExecution:
         """
-        Parses, executes, and repairs a single LLM completion candidate.
-        P0-4 / P0-6: Fails sample if TYPE is missing, or if result is NULL/empty for scalar types.
+        Parses, executes, and self-repairs a candidate sample.
+        Canonicalizes output into competition types.
         """
         pred_type, sql = parse_completion(raw_completion)
 
@@ -578,19 +465,21 @@ class ExecutorVoter:
                 success=False,
                 error="Missing or invalid TYPE in completion",
                 failure_category="OUTPUT_PARSE_ERROR",
+                is_thinking=is_thinking,
             )
 
         if pred_type == "unanswerable":
             return CandidateExecution(
                 sample_id=sample_id,
                 raw_completion=raw_completion,
-                parsed_type=pred_type,
-                parsed_sql=sql,
+                parsed_type="unanswerable",
+                parsed_sql=None,
                 raw_result=None,
                 normalized_value=None,
-                vote_key="unanswerable:__null__",
+                vote_key="unanswerable",
                 success=True,
                 failure_category="SUCCESS",
+                is_thinking=is_thinking,
             )
 
         if not sql:
@@ -602,6 +491,7 @@ class ExecutorVoter:
                 success=False,
                 error="No SQL query found",
                 failure_category="SQL_EXTRACTION_ERROR",
+                is_thinking=is_thinking,
             )
 
         current_sql = sql
@@ -615,15 +505,14 @@ class ExecutorVoter:
         for turn in range(self.max_repairs + 1):
             ok, res_rows, err, cols = self.execute_single_sql(current_sql, pred_type)
             if ok:
-                norm_val = cast_duckdb_result(res_rows, pred_type, cols, sql=current_sql)
-                if norm_val is not None:
+                norm_val, v_key = canonicalize_for_voting(pred_type, res_rows)
+                if norm_val is not None and v_key is not None:
                     success = True
                     rows = res_rows
                     col_names = cols
                     failure_cat = "SUCCESS"
                     break
                 else:
-                    # Query executed but produced NULL or 0 rows
                     last_error = f"Query executed successfully but returned NULL or empty output for TYPE '{pred_type}'"
                     failure_cat = "EMPTY_RESULT"
                     if turn < self.max_repairs:
@@ -645,8 +534,8 @@ class ExecutorVoter:
                 break
 
         if success and rows is not None:
-            norm_val = cast_duckdb_result(rows, pred_type, col_names, sql=current_sql)
-            if norm_val is None:
+            norm_val, v_key = canonicalize_for_voting(pred_type, rows)
+            if norm_val is None or v_key is None:
                 return CandidateExecution(
                     sample_id=sample_id,
                     raw_completion=raw_completion,
@@ -659,9 +548,9 @@ class ExecutorVoter:
                     error=f"Query returned NULL or empty result for type '{pred_type}'",
                     failure_category="EMPTY_RESULT",
                     repair_turns=repair_count,
+                    is_thinking=is_thinking,
                 )
 
-            v_key = make_vote_key(pred_type, norm_val)
             return CandidateExecution(
                 sample_id=sample_id,
                 raw_completion=raw_completion,
@@ -673,6 +562,7 @@ class ExecutorVoter:
                 success=True,
                 failure_category="SUCCESS",
                 repair_turns=repair_count,
+                is_thinking=is_thinking,
             )
         else:
             return CandidateExecution(
@@ -684,6 +574,7 @@ class ExecutorVoter:
                 error=last_error,
                 failure_category=failure_cat or "SQL_EXECUTION_ERROR",
                 repair_turns=repair_count,
+                is_thinking=is_thinking,
             )
 
     def vote_and_decide(
@@ -692,15 +583,18 @@ class ExecutorVoter:
         business_id: str,
         candidates: List[CandidateExecution],
         elapsed: float,
+        denominator: Optional[int] = None,
     ) -> QuestionInferenceResult:
         """
-        Performs majority voting across candidate execution keys.
-        If top key agreement share < tau=0.5 or winning candidate is invalid, returns abstain.
+        Groups valid executions by (ans_type, canonical_voting_key).
+        Computes top_share = top_group_count / total_samples (where denominator is 8, or 12).
+        If top_share >= 0.5, outputs the representative formatted answer of the winning group.
+        Otherwise, outputs abstain.
         """
         valid_candidates = [c for c in candidates if c.success and c.vote_key is not None]
-        total_valid = len(valid_candidates)
+        total_samples = denominator or len(candidates)
 
-        if total_valid == 0:
+        if not valid_candidates or total_samples == 0:
             first_err = candidates[0].error if candidates else "No candidates"
             cat = candidates[0].failure_category if candidates else "FINAL_ABSTENTION"
             return QuestionInferenceResult(
@@ -709,7 +603,7 @@ class ExecutorVoter:
                 final_type="abstain",
                 final_answer=None,
                 confidence=0.0,
-                total_samples=len(candidates),
+                total_samples=total_samples,
                 agreement_count=0,
                 elapsed_time=elapsed,
                 candidates=candidates,
@@ -717,16 +611,21 @@ class ExecutorVoter:
                 reason=f"All candidate SQL queries failed ({cat}): {first_err}",
             )
 
-        key_counts = Counter(c.vote_key for c in valid_candidates)
-        top_key, top_count = key_counts.most_common(1)[0]
-        # In single-shot or self-repair workflows (len <= 2), evaluate agreement over valid executions.
-        # In multi-sample ensemble voting (len >= 3), require majority over total candidates.
-        share = (top_count / total_valid) if len(candidates) <= 2 else (top_count / len(candidates))
+        # Group by (type, vote_key)
+        group_counts: Dict[Tuple[str, str], int] = Counter(
+            (c.parsed_type, c.vote_key) for c in valid_candidates
+        )
+        (top_type, top_key), top_count = group_counts.most_common(1)[0]
+        top_share = top_count / total_samples
 
-        if share >= self.tau:
-            winning_candidate = next(c for c in valid_candidates if c.vote_key == top_key)
-            final_t = winning_candidate.parsed_type
-            final_a = winning_candidate.normalized_value
+        vote_distribution = {f"{t}:{k}": cnt for (t, k), cnt in group_counts.items()}
+
+        if top_share >= self.tau:
+            winning_cand = next(
+                c for c in valid_candidates if c.parsed_type == top_type and c.vote_key == top_key
+            )
+            final_t = winning_cand.parsed_type
+            final_a = winning_cand.normalized_value
 
             # Validate against official competition schema
             test_sub = {"id": question_id, "type": final_t, "answer": final_a}
@@ -740,12 +639,12 @@ class ExecutorVoter:
                 business_id=business_id,
                 final_type=final_t,
                 final_answer=final_a,
-                confidence=share,
-                total_samples=len(candidates),
+                confidence=top_share,
+                total_samples=total_samples,
                 agreement_count=top_count,
                 elapsed_time=elapsed,
                 candidates=candidates,
-                vote_distribution=dict(key_counts),
+                vote_distribution=vote_distribution,
             )
         else:
             return QuestionInferenceResult(
@@ -753,11 +652,11 @@ class ExecutorVoter:
                 business_id=business_id,
                 final_type="abstain",
                 final_answer=None,
-                confidence=share,
-                total_samples=len(candidates),
+                confidence=top_share,
+                total_samples=total_samples,
                 agreement_count=top_count,
                 elapsed_time=elapsed,
                 candidates=candidates,
-                vote_distribution=dict(key_counts),
-                reason=f"Voting agreement insufficient ({top_count}/{len(candidates)} = {share:.2f}) < tau={self.tau}",
+                vote_distribution=vote_distribution,
+                reason=f"Voting agreement insufficient ({top_count}/{total_samples} = {top_share:.2f}) < tau={self.tau}",
             )

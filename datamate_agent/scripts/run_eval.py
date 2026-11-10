@@ -41,7 +41,7 @@ def main():
     parser.add_argument("--adapter", default=None, help="Adapter path override")
     parser.add_argument("--config", default=None, help="Path to config.yaml")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of questions for quick testing")
-    parser.add_argument("--k", type=int, default=1, help="Number of samples per question (default 1 for fast greedy decoding, set 3 or 8 for voting)")
+    parser.add_argument("--k", type=int, default=None, help="Number of samples per question (defaults to config: 8)")
     parser.add_argument("--verbose", action="store_true", help="Print details on incorrect answers")
     
     args = parser.parse_args()

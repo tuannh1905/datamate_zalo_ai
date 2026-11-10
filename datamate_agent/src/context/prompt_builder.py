@@ -1,8 +1,10 @@
 """
 Prompt Builder for DataMate Challenge.
-Assembles SYSTEM prompt (DuckDB SQL rules + dynamic rulebook.md) and
-USER prompt (README, raw schema, canonical views, date anchors, 4 few-shot examples, question).
-Appends Assistant prefill "Notes:\n-".
+Strict static-to-dynamic prompt hierarchy for vLLM KV Prefix Caching hit:
+1. SYSTEM: Static sql_rules_system.txt + split's rulebook.md (100% shared across all questions in split).
+2. USER Part 1 (Shop Static Prefix): README + RAW SCHEMA (sample rows & column mappings) + CANONICAL VIEWS & MACROS.
+3. USER Part 2 (Question Dynamic Suffix): DATE ANCHORS + 4 Few-Shot Examples + QUESTION & Vietnamese abbreviations hint.
+4. ASSISTANT Prefill: Always end raw prompt string with 'Notes:\n-'.
 """
 
 import hashlib
@@ -12,7 +14,6 @@ from typing import Any, Dict, List, Optional
 
 from ..data_layer.ingest import BusinessContext
 from .date_resolver import DateResolution, DateResolver
-from .rule_router import route_rulebook
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ def build_chat_prompt(
     Standardized chat prompt builder across train, inference, and repair.
     Applies tokenizer.apply_chat_template(messages, add_generation_prompt=True) + prefill.
     Falls back to ChatML format if tokenizer is unavailable.
+    Always ends raw prompt string with prefill ("Notes:\n-").
     """
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
@@ -35,7 +37,8 @@ def build_chat_prompt(
                 add_generation_prompt=True,
             )
             if prefill:
-                formatted = formatted + prefill
+                if not formatted.endswith(prefill):
+                    formatted = formatted + prefill
             return formatted
         except Exception:
             pass
@@ -50,11 +53,6 @@ def build_chat_prompt(
     return "\n".join(parts)
 
 
-# 4 Curated Few-Shot Examples representing core question types:
-# 1. Number (Revenue excluding cancelled/returned orders)
-# 2. Percent (Cancellation rate or growth rate)
-# 3. List / String (Top ranking items with code tie-breaker)
-# 4. Unanswerable (Missing required financial / inventory columns)
 FEW_SHOT_EXAMPLES = """
 Example 1 (Doanh thu tháng này - number):
 Question: "doanh thu tháng này của quán là bao nhiêu?"
@@ -160,8 +158,7 @@ class PromptBuilder:
 
     def get_rulebook_content(self, runtime_rulebook_path: Optional[str] = None) -> str:
         """
-        Dynamically reads rulebook.md at runtime (mandatory for competition test splits)
-        and logs its SHA1 checksum to guarantee the correct split rulebook is active.
+        Dynamically reads rulebook.md at runtime and logs SHA1 checksum.
         """
         path = runtime_rulebook_path or self.rulebook_path
         if path and os.path.exists(path):
@@ -185,18 +182,14 @@ class PromptBuilder:
         question: Optional[str] = None,
     ) -> str:
         """
-        Injects dynamic, selectively routed rulebook into system prompt.
-        If question is provided, prunes irrelevant sections to optimize context length and GPU prefill.
+        Builds static SYSTEM prompt: sql_rules_system.txt + split's rulebook.md.
+        100% shared across ALL questions in the split for maximum vLLM prefix cache hit.
         """
         rulebook_text = self.get_rulebook_content(runtime_rulebook_path)
-        if question:
-            rulebook_text = route_rulebook(rulebook_text, question)
         return self.system_template.format(rulebook_content=rulebook_text)
 
-    def build_user_prompt(
+    def build_shop_static_prefix(
         self,
-        question: str,
-        as_of_date: str,
         ctx: BusinessContext,
         canonical_sales_sql: Optional[str] = None,
         canonical_orders_sql: Optional[str] = None,
@@ -204,19 +197,20 @@ class PromptBuilder:
         has_debt_macros: bool = False,
     ) -> str:
         """
-        Assembles full user prompt following token budget distribution.
+        USER Part 1 (Shop Static Prefix):
+        - README.md
+        - RAW SCHEMA (with sample rows & original->clean column mappings)
+        - CANONICAL VIEWS (v_sales, v_orders) & DEBT MACROS.
+        100% shared across all questions of the same business_id.
         """
-        # 1. Truncate README if necessary (keep concise to protect GPU memory)
         readme = ctx.readme_text.strip()
         if len(readme) > 1000:
             readme = readme[:1000] + "\n...[truncated]"
         if not readme:
             readme = "No README provided."
 
-        # 2. Schema summary
         schema_summary = ctx.get_schema_summary()
 
-        # 3. Canonical Views & Macros Section
         views_section = []
         if canonical_sales_sql and canonical_orders_sql:
             views_section.append("Canonical Views Available:")
@@ -233,23 +227,107 @@ class PromptBuilder:
             views_section.append("- `debt_repaid('start', 'end')`: Table macro of debt repayments collected in period")
         canonical_str = "\n".join(views_section) if views_section else "No canonical views built; query raw tables directly."
 
-        # 4. Date anchors
+        prefix_parts = [
+            "===================================================================",
+            "1. BUSINESS OVERVIEW (README)",
+            "===================================================================",
+            f"Business ID: {ctx.business_id}",
+            readme,
+            "",
+            "===================================================================",
+            "2. DATABASE SCHEMA & SAMPLE DATA",
+            "===================================================================",
+            "The DuckDB database contains the following tables:",
+            schema_summary,
+            "",
+            "===================================================================",
+            "3. CANONICAL VIEWS & MACROS (IF CONSTRUCTED)",
+            "===================================================================",
+            canonical_str,
+        ]
+        return "\n".join(prefix_parts)
+
+    def build_question_dynamic_suffix(
+        self,
+        question: str,
+        as_of_date: str,
+    ) -> str:
+        """
+        USER Part 2 (Question Dynamic Suffix):
+        - DATE ANCHORS (today = as_of_date, resolved windows for tuần này, tuần rồi, tháng này, Tết, etc.)
+        - RULEBOOK CONSTRAINTS
+        - 4 Few-Shot SQL Examples
+        - QUESTION & Vietnamese abbreviations hint.
+        """
         date_res = self.date_resolver.resolve(question, as_of_date)
         date_explanation = date_res.explanation
 
-        # 5. Format User Template
-        user_prompt = self.user_template.format(
-            business_id=ctx.business_id,
-            business_readme=readme,
-            schema_and_samples=schema_summary,
-            canonical_views_section=canonical_str,
-            as_of_date=as_of_date,
-            date_anchors_explanation=date_explanation,
-            few_shot_examples=FEW_SHOT_EXAMPLES,
-            question=question,
-        )
+        suffix_parts = [
+            "===================================================================",
+            "4. DATE ANCHORS & TIME WINDOW RESOLUTION",
+            "===================================================================",
+            f"- Today (as_of_date): {as_of_date}",
+            "- Target Date Context:",
+            date_explanation,
+            "",
+            "===================================================================",
+            "5. RULEBOOK CONSTRAINTS & HINTS",
+            "===================================================================",
+            "- The Business Rulebook provided in the system prompt is the authoritative single source of truth for all metric calculations, status filtering, date definitions, ranking ties, and rounding conventions.",
+            "- If the required columns or tables do not exist in the database to answer the question, output TYPE: unanswerable.",
+            "- Ensure all queries are valid DuckDB SQL syntax.",
+            "- When canonical views (`v_sales`, `v_orders`) are available, you may query them; otherwise query raw tables directly.",
+            "",
+            "===================================================================",
+            "6. FEW-SHOT EXAMPLES (SIMILAR QUESTIONS)",
+            "===================================================================",
+            FEW_SHOT_EXAMPLES,
+            "",
+            "===================================================================",
+            "7. CURRENT QUESTION & HINTS",
+            "===================================================================",
+            f'Question: "{question}"',
+            f"As-of Date: {as_of_date}",
+            "",
+            "Vietnamese abbreviations hint:",
+            "- 'doanh thu', 'dt' = sales revenue",
+            "- 'đơn', 'đh', 'hd', 'hóa đơn' = orders / invoices",
+            "- 'kh', 'khách' = customer",
+            "- 'sp', 'hàng', 'món' = product / item",
+            "- 'ncc' = supplier",
+            "- 'cn', 'nợ' = debt / credit",
+            "- 'sl' = quantity",
+            "- 'km', 'ck' = discount / promotion",
+            "",
+            "Please write your reasoning in Notes, then output the target TYPE and the DuckDB SQL query.",
+        ]
+        return "\n".join(suffix_parts)
 
-        return user_prompt
+    def build_user_prompt(
+        self,
+        question: str,
+        as_of_date: str,
+        ctx: BusinessContext,
+        canonical_sales_sql: Optional[str] = None,
+        canonical_orders_sql: Optional[str] = None,
+        canonical_purchases_sql: Optional[str] = None,
+        has_debt_macros: bool = False,
+    ) -> str:
+        """
+        Assembles full user prompt with strict static-prefix then dynamic-suffix ordering.
+        """
+        shop_prefix = self.build_shop_static_prefix(
+            ctx=ctx,
+            canonical_sales_sql=canonical_sales_sql,
+            canonical_orders_sql=canonical_orders_sql,
+            canonical_purchases_sql=canonical_purchases_sql,
+            has_debt_macros=has_debt_macros,
+        )
+        question_suffix = self.build_question_dynamic_suffix(
+            question=question,
+            as_of_date=as_of_date,
+        )
+        return shop_prefix + "\n\n" + question_suffix
 
     def build_messages(
         self,
@@ -263,9 +341,9 @@ class PromptBuilder:
         runtime_rulebook_path: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """
-        Creates OpenAI/vLLM format message list with Assistant prefill.
+        Creates OpenAI/vLLM format message list with strict static-to-dynamic prompt hierarchy.
         """
-        sys_prompt = self.build_system_prompt(runtime_rulebook_path, question=question)
+        sys_prompt = self.build_system_prompt(runtime_rulebook_path)
         user_prompt = self.build_user_prompt(
             question=question,
             as_of_date=as_of_date,

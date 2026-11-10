@@ -24,7 +24,7 @@ def train_qlora(
     num_train_epochs: int = 1,
     per_device_batch_size: int = 2,
     gradient_accumulation_steps: int = 4,
-    max_seq_length: int = 4096,
+    max_seq_length: int = 16384,
 ) -> None:
     """
     Fine-tunes the Student model with 4-bit QLoRA using verified rejection-sampled trajectories.
@@ -166,9 +166,19 @@ def train_qlora(
 
         dataset = dataset.map(format_chat)
 
-        # Mask prompt tokens
+        # Mask prompt tokens: loss is strictly computed ONLY on the assistant reply tokens
         response_template = "Notes:\n-"
-        collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer)
+        try:
+            collator = DataCollatorForCompletionOnlyLM(
+                instruction_template="<|im_start|>user\n",
+                response_template=response_template,
+                tokenizer=tokenizer,
+            )
+        except Exception:
+            collator = DataCollatorForCompletionOnlyLM(
+                response_template=response_template,
+                tokenizer=tokenizer,
+            )
 
         # Check token lengths of training samples to prevent truncated SQL responses
         truncated_count = 0

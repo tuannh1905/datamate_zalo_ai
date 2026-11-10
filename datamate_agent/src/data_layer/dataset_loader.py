@@ -9,7 +9,7 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -207,3 +207,33 @@ def load_dataset(
     paths.validate()
     logger.info(paths.summary())
     return paths
+
+
+def load_questions(questions_path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Loads questions from questions.jsonl preserving original line-by-line order.
+    """
+    import json
+    questions = []
+    with open(questions_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                questions.append(json.loads(line))
+    if limit is not None:
+        questions = questions[:limit]
+    return questions
+
+
+def group_questions_by_business(
+    questions: List[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Groups questions by business_id for shop-centric batch execution.
+    """
+    from collections import defaultdict
+    biz_groups = defaultdict(list)
+    for q in questions:
+        biz_groups[q.get("business_id", "")].append(q)
+    return dict(biz_groups)
+

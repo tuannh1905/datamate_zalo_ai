@@ -32,14 +32,14 @@ model:
   trust_remote_code: true
 
 inference:
-  # Sampling parameters for plain samples (k=1 for fast greedy decoding, set k=3 or 8 for voting)
-  num_samples_k: 1
-  temperature: 0.0
+  # Sampling parameters for plain samples (n=8 parallel batch sampling)
+  num_samples_k: 8
+  temperature: 0.7
   top_p: 0.95
   max_new_tokens: 512
   
-  # Thinking / Deep reasoning samples (0 for fast, +2 or +4 on low agreement)
-  num_thinking_samples: 0
+  # Thinking / Deep reasoning samples (+4 on low agreement < 0.5)
+  num_thinking_samples: 4
   thinking_temperature: 0.6
   thinking_max_new_tokens: 1024
   
@@ -48,7 +48,7 @@ inference:
   abstain_on_failure: true
 
 execution:
-  sql_timeout_seconds: 10.0
+  sql_timeout_seconds: 5.0
   max_repair_turns: 2
   max_rows_output: 100
   memory_limit: "4GB"

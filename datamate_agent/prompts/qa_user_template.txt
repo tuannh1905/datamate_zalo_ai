@@ -36,9 +36,19 @@ The DuckDB database contains the following tables:
 {few_shot_examples}
 
 ===================================================================
-7. CURRENT QUESTION
+7. CURRENT QUESTION & HINTS
 ===================================================================
 Question: "{question}"
 As-of Date: {as_of_date}
+
+Vietnamese abbreviations hint:
+- 'doanh thu', 'dt' = sales revenue
+- 'đơn', 'đh', 'hd', 'hóa đơn' = orders / invoices
+- 'kh', 'khách' = customer
+- 'sp', 'hàng', 'món' = product / item
+- 'ncc' = supplier
+- 'cn', 'nợ' = debt / credit
+- 'sl' = quantity
+- 'km', 'ck' = discount / promotion
 
 Please write your reasoning in Notes, then output the target TYPE and the DuckDB SQL query.

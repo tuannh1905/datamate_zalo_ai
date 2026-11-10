@@ -29,8 +29,20 @@ def register_debt_macros(ctx: BusinessContext, plausibility_check: bool = True) 
     """
     Detects payment/debt structures in business tables, creates canonical `v_payments` if needed,
     registers `debt_at`, `debt_new`, and `debt_repaid` DuckDB macros, and validates them.
+    Skips re-registration if already loaded from cached DuckDB.
     """
+    if getattr(ctx, "debt_macros_registered", False):
+        return DebtMacroStatus(registered=True, plausibility_passed=True)
+
     con = ctx.con
+
+    # Check if debt_at macro already exists in the database
+    try:
+        con.execute("SELECT 1 FROM debt_at('2026-12-31') LIMIT 1")
+        ctx.debt_macros_registered = True
+        return DebtMacroStatus(registered=True, plausibility_passed=True)
+    except Exception:
+        pass
 
     # Check if v_orders exists
     try:

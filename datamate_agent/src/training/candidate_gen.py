@@ -1,21 +1,26 @@
 """
 Candidate Generation Module for DataMate Challenge.
 Generates 8 plain + 4 thinking samples per training question using the Student model,
-executes them in DuckDB, and saves full trajectories to candidates.jsonl.
+groups by business_id for DuckDB view reuse and prefix caching,
+executes them in DuckDB with self-repair, preserves original question order in candidates.jsonl,
+and explicitly releases GPU memory and shuts down Ray.
 """
 
 import argparse
+import gc
 import json
 import logging
 import os
 import time
 from typing import Any, Dict, List, Optional
 
+import torch
 from tqdm import tqdm
 
 from ..context.prompt_builder import PromptBuilder, build_chat_prompt
+from ..data_layer.dataset_loader import group_questions_by_business, load_questions
 from ..data_layer.debt_macros import register_debt_macros
-from ..data_layer.ingest import BusinessContext, load_business_data
+from ..data_layer.ingest import BusinessContext, load_business_data, resolve_business_dir
 from ..data_layer.view_builder import build_canonical_views
 from ..inference.executor_voter import CandidateExecution, ExecutorVoter
 from ..inference.llm_engine import LLMEngine
@@ -34,9 +39,12 @@ def generate_training_candidates(
     num_plain_samples: int = 8,
     num_thinking_samples: int = 4,
     limit: Optional[int] = None,
+    allow_mock: bool = False,
 ) -> None:
     """
     Runs Student model to generate candidate reasoning + SQL solutions for training questions.
+    Groups questions by business_id for shop static prefix caching and DuckDB view reuse,
+    while writing candidates in original questions order.
     """
     logger.info("Initializing PromptBuilder and LLMEngine...")
     prompt_builder = PromptBuilder(
@@ -49,118 +57,167 @@ def generate_training_candidates(
     llm_engine = LLMEngine(
         model_name_or_path=model_name_or_path,
         adapter_path=adapter_path,
+        allow_mock=allow_mock,
     )
 
-    # Load questions
-    questions = []
-    with open(questions_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                questions.append(json.loads(line))
-
-    if limit:
-        questions = questions[:limit]
-
-    logger.info(f"Loaded {len(questions)} questions. Output will be saved to {output_path}")
+    # Load questions preserving original order
+    original_questions = load_questions(questions_path, limit=limit)
+    logger.info(f"Loaded {len(original_questions)} questions. Output will be saved to {output_path}")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    # Cache business contexts to avoid repeated disk reads
-    biz_cache: Dict[str, BusinessContext] = {}
+    # Group by business_id for shop-centric batching
+    biz_groups = group_questions_by_business(original_questions)
+    records_by_id: Dict[str, Dict[str, Any]] = {}
 
-    out_file = open(output_path, "w", encoding="utf-8")
+    sys_prompt = prompt_builder.build_system_prompt(rulebook_path)
 
-    for q in tqdm(questions, desc="Generating Candidates"):
-        q_id = q["id"]
-        b_id = q["business_id"]
-        question_text = q["question"]
-        as_of_date = q["as_of_date"]
+    for b_id, q_list in tqdm(biz_groups.items(), desc="Processing Businesses"):
+        b_dir = resolve_business_dir(data_dir, b_id)
+        if not b_dir:
+            logger.warning(f"Business data directory for '{b_id}' not found under '{data_dir}'. Skipping.")
+            continue
 
-        # Load business context
-        if b_id not in biz_cache:
-            b_dir = os.path.join(data_dir, b_id)
-            ctx = load_business_data(b_id, b_dir)
-            view_res = build_canonical_views(ctx, k=8)
-            debt_status = register_debt_macros(ctx, plausibility_check=True)
-            biz_cache[b_id] = (ctx, view_res, debt_status)
-        else:
-            ctx, view_res, debt_status = biz_cache[b_id]
+        ctx = load_business_data(b_id, b_dir)
+        view_res = build_canonical_views(ctx, k=8)
+        debt_status = register_debt_macros(ctx, plausibility_check=True)
 
-        # Build prompt
-        messages = prompt_builder.build_messages(
-            question=question_text,
-            as_of_date=as_of_date,
+        shop_prefix = prompt_builder.build_shop_static_prefix(
             ctx=ctx,
             canonical_sales_sql=view_res.v_sales_sql if view_res.success else None,
             canonical_orders_sql=view_res.v_orders_sql if view_res.success else None,
             canonical_purchases_sql=view_res.v_purchases_sql if view_res.success else None,
             has_debt_macros=debt_status.registered,
-            runtime_rulebook_path=rulebook_path,
         )
 
-        user_content = messages[1]["content"]
-        full_prompt = build_chat_prompt(
-            tokenizer=llm_engine.tokenizer,
-            messages=messages,
-            prefill="Notes:\n-",
+        voter = ExecutorVoter(
+            con=ctx.con,
+            llm_engine=llm_engine,
+            schema_summary=ctx.get_schema_summary(),
         )
 
-        # 1. Generate 8 plain samples (temp 0.1)
-        plain_completions = llm_engine.generate_single(
-            prompt=full_prompt,
-            n=num_plain_samples,
-            temperature=0.1,
-            max_new_tokens=1024,
-        )
+        for q in q_list:
+            q_id = q["id"]
+            question_text = q["question"]
+            as_of_date = q["as_of_date"]
 
-        # 2. Generate 4 thinking samples (temp 0.6, max_tokens 2048)
-        thinking_completions = llm_engine.generate_single(
-            prompt=full_prompt,
-            n=num_thinking_samples,
-            temperature=0.6,
-            max_new_tokens=2048,
-        )
+            q_suffix = prompt_builder.build_question_dynamic_suffix(question_text, as_of_date)
+            user_prompt = shop_prefix + "\n\n" + q_suffix
 
-        all_completions = plain_completions + thinking_completions
-
-        # Execute and validate each completion
-        voter = ExecutorVoter(ctx.con, llm_engine)
-        sample_records = []
-
-        for idx, comp in enumerate(all_completions):
-            full_text = "Notes:\n-" + comp
-            cand = voter.process_candidate(
-                sample_id=idx,
-                raw_completion=full_text,
-                orig_question=question_text,
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            full_prompt = build_chat_prompt(
+                tokenizer=llm_engine.tokenizer,
+                messages=messages,
+                prefill="Notes:\n-",
             )
-            sample_records.append({
-                "sample_id": idx,
-                "is_thinking": (idx >= num_plain_samples),
-                "completion": full_text,
-                "parsed_type": cand.parsed_type,
-                "parsed_sql": cand.parsed_sql,
-                "success": cand.success,
-                "normalized_value": cand.normalized_value,
-                "vote_key": cand.vote_key,
-                "error": cand.error,
-                "repair_turns": cand.repair_turns,
-            })
 
-        record = {
-            "id": q_id,
-            "business_id": b_id,
-            "question": question_text,
-            "as_of_date": as_of_date,
-            "system_prompt": messages[0]["content"],
-            "user_prompt": user_content,
-            "samples": sample_records,
-        }
-        out_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-        out_file.flush()
+            # 1. Generate plain samples in single batch forward pass
+            plain_completions = llm_engine.generate_samples(
+                prompts=[full_prompt],
+                n=num_plain_samples,
+                temperature=0.7,
+                max_tokens=512,
+            )[0]
 
-    out_file.close()
+            # 2. Generate thinking samples in single batch forward pass
+            thinking_user_prompt = (
+                user_prompt
+                + "\n\nThinking Step-by-Step Instructions: Carefully verify all filters, date windows, join conditions, and calculations before outputting TYPE and SQL."
+            )
+            thinking_messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": thinking_user_prompt},
+            ]
+            thinking_prompt = build_chat_prompt(
+                tokenizer=llm_engine.tokenizer,
+                messages=thinking_messages,
+                prefill="Notes:\n-",
+            )
+            thinking_completions = llm_engine.generate_samples(
+                prompts=[thinking_prompt],
+                n=num_thinking_samples,
+                temperature=0.6,
+                max_tokens=1024,
+            )[0]
+
+            sample_records = []
+
+            for idx, comp in enumerate(plain_completions):
+                full_text = comp if comp.startswith("Notes:\n-") else ("Notes:\n-" + comp)
+                cand = voter.process_candidate(
+                    sample_id=idx,
+                    raw_completion=full_text,
+                    orig_question=question_text,
+                    is_thinking=False,
+                )
+                sample_records.append({
+                    "sample_id": idx,
+                    "is_thinking": False,
+                    "completion": full_text,
+                    "parsed_type": cand.parsed_type,
+                    "parsed_sql": cand.parsed_sql,
+                    "success": cand.success,
+                    "normalized_value": cand.normalized_value,
+                    "vote_key": cand.vote_key,
+                    "error": cand.error,
+                    "repair_turns": cand.repair_turns,
+                })
+
+            for idx, comp in enumerate(thinking_completions):
+                full_text = comp if comp.startswith("Notes:\n-") else ("Notes:\n-" + comp)
+                cand = voter.process_candidate(
+                    sample_id=num_plain_samples + idx,
+                    raw_completion=full_text,
+                    orig_question=question_text,
+                    is_thinking=True,
+                )
+                sample_records.append({
+                    "sample_id": num_plain_samples + idx,
+                    "is_thinking": True,
+                    "completion": full_text,
+                    "parsed_type": cand.parsed_type,
+                    "parsed_sql": cand.parsed_sql,
+                    "success": cand.success,
+                    "normalized_value": cand.normalized_value,
+                    "vote_key": cand.vote_key,
+                    "error": cand.error,
+                    "repair_turns": cand.repair_turns,
+                })
+
+            records_by_id[q_id] = {
+                "id": q_id,
+                "business_id": b_id,
+                "question": question_text,
+                "as_of_date": as_of_date,
+                "system_prompt": sys_prompt,
+                "user_prompt": user_prompt,
+                "samples": sample_records,
+            }
+
+    # Write output file in EXACT original question order
+    with open(output_path, "w", encoding="utf-8") as out_file:
+        for q in original_questions:
+            qid = q["id"]
+            if qid in records_by_id:
+                out_file.write(json.dumps(records_by_id[qid], ensure_ascii=False) + "\n")
+
     logger.info(f"Finished generating candidates. Saved to {output_path}")
+
+    # Subprocess isolation & memory cleanup
+    logger.info("Cleaning up GPU memory and Ray processes...")
+    del llm_engine
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    try:
+        import ray
+        if ray.is_initialized():
+            ray.shutdown()
+            logger.info("Ray shutdown successfully.")
+    except Exception:
+        pass
 
 
 def main():
@@ -176,6 +233,7 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen2.5-Coder-3B-Instruct", help="Model name or path")
     parser.add_argument("--adapter", default=None, help="LoRA adapter path")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of questions")
+    parser.add_argument("--allow_mock", action="store_true", help="Allow fallback mock mode")
     args = parser.parse_args()
 
     questions_path = args.questions
@@ -207,6 +265,7 @@ def main():
         model_name_or_path=args.model,
         adapter_path=args.adapter,
         limit=args.limit,
+        allow_mock=args.allow_mock,
     )
 
 

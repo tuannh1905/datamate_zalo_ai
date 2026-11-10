@@ -1,7 +1,8 @@
 """
 Offline LLM Engine for DataMate Challenge.
-Wraps vLLM for high-throughput batch generation with offline weights,
-with seamless fallback to Hugging Face Transformers GPU (4-bit/bfloat16)
+Wraps vLLM for high-throughput batch generation with prefix caching,
+VRAM auto-detection (Colab T4 / L4), 4-bit quantization, and dynamic LoRA loading,
+with seamless fallback to Hugging Face Transformers GPU (4-bit BitsAndBytes)
 and CPU mock mode.
 """
 
@@ -16,8 +17,12 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 logger = logging.getLogger(__name__)
 
 # Check if PyTorch and CUDA are available
-import torch
-HAS_CUDA = torch.cuda.is_available()
+try:
+    import torch
+    HAS_CUDA = torch.cuda.is_available()
+except ImportError:
+    torch = None
+    HAS_CUDA = False
 
 # Check if vLLM is available
 HAS_VLLM = False
@@ -45,7 +50,7 @@ class LLMEngine:
     ):
         self.model_name_or_path = model_name_or_path
         self.adapter_path = adapter_path
-        self.max_model_len = max_model_len
+        self.max_model_len = min(max_model_len, 16384) if max_model_len else 16384
         self.allow_mock = allow_mock
         self.llm = None
         self.lora_request = None
@@ -66,43 +71,80 @@ class LLMEngine:
         if HAS_VLLM and (os.path.exists(model_name_or_path) or "/" in model_name_or_path):
             try:
                 logger.info(f"Initializing vLLM engine with model: {model_name_or_path}")
-                enable_lora = bool(adapter_path)
-                
+
+                # Auto-detect GPU VRAM
+                is_low_vram = False
+                vram_gb = 0.0
+                if HAS_CUDA and torch.cuda.is_available():
+                    try:
+                        total_vram = torch.cuda.get_device_properties(0).total_memory
+                        vram_gb = total_vram / (1024 ** 3)
+                        logger.info(f"[GPU Auto-Detect] Device: {torch.cuda.get_device_name(0)}, Total VRAM: {vram_gb:.2f} GB")
+                        if vram_gb < 18.0:
+                            is_low_vram = True
+                            logger.info(f"[VRAM Guard] VRAM < 18GB (e.g. Colab T4). Forcing dtype='half' and 4-bit quantization.")
+                    except Exception as e:
+                        logger.warning(f"Failed to check GPU memory: {e}")
+
                 vllm_kwargs: Dict[str, Any] = {
                     "model": model_name_or_path,
                     "tensor_parallel_size": tensor_parallel_size,
                     "gpu_memory_utilization": gpu_memory_utilization,
-                    "max_model_len": max_model_len,
+                    "max_model_len": self.max_model_len,
+                    "enable_prefix_caching": True,  # Critical for 14k prefix reuse
                     "trust_remote_code": trust_remote_code,
-                    "enable_lora": enable_lora,
+                    "enable_lora": True,  # Support dynamic LoRA loading
+                    "max_lora_rank": 16,
                 }
-                if quantization:
+
+                if is_low_vram:
+                    vllm_kwargs["dtype"] = "half"
+                    chosen_quant = quantization or "bitsandbytes"
+                    vllm_kwargs["quantization"] = chosen_quant
+                    if chosen_quant == "bitsandbytes":
+                        vllm_kwargs["load_format"] = "bitsandbytes"
+                elif quantization:
                     vllm_kwargs["quantization"] = quantization
+                    if quantization == "bitsandbytes":
+                        vllm_kwargs["load_format"] = "bitsandbytes"
+
                 if enforce_eager:
                     vllm_kwargs["enforce_eager"] = True
 
-                self.llm = LLM(**vllm_kwargs)
+                try:
+                    self.llm = LLM(**vllm_kwargs)
+                except Exception as quant_err:
+                    if "quantization" in vllm_kwargs:
+                        logger.warning(f"vLLM init with quantization failed ({quant_err}). Retrying with dtype='half' without quantization...")
+                        vllm_kwargs.pop("quantization", None)
+                        vllm_kwargs.pop("load_format", None)
+                        vllm_kwargs["dtype"] = "half"
+                        self.llm = LLM(**vllm_kwargs)
+                    else:
+                        raise quant_err
+
                 self.is_offline_vllm = True
 
-                if enable_lora:
+                if adapter_path:
                     try:
                         self.lora_request = LoRARequest("datamate_adapter", 1, adapter_path)
                         logger.info(f"Loaded LoRA adapter into vLLM from: {adapter_path}")
                     except Exception as lora_err:
                         raise RuntimeError(f"Failed to load LoRA adapter into vLLM from '{adapter_path}': {lora_err}")
-                logger.info(f"vLLM engine initialized successfully (Model: {model_name_or_path}, Adapter: {adapter_path or 'None'}).")
+
+                logger.info(f"vLLM engine initialized successfully (Model: {model_name_or_path}, Adapter: {adapter_path or 'None'}, Prefix Caching: True).")
             except Exception as e:
-                logger.warning(f"Could not initialize vLLM: {e}")
+                logger.warning(f"Could not initialize vLLM: {e}. Falling back to HuggingFace Transformers...")
                 self.llm = None
                 self.is_offline_vllm = False
 
-        # 2. If vLLM is not active but CUDA is available, use HuggingFace Transformers
+        # 2. If vLLM is not active but CUDA is available, use HuggingFace Transformers + bitsandbytes 4-bit
         if not self.is_offline_vllm and HAS_CUDA and (os.path.exists(model_name_or_path) or "/" in model_name_or_path):
             try:
                 from transformers import AutoModelForCausalLM, AutoTokenizer
                 logger.info(f"Loading Hugging Face model on GPU: {model_name_or_path}")
                 self.hf_tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
-                
+
                 is_ampere_or_later = False
                 if torch.cuda.is_available():
                     try:
@@ -114,7 +156,7 @@ class LLMEngine:
 
                 loaded_successfully = False
                 quant_used = "None"
-                # Try 4-bit quantization first (essential for T4 16GB GPU)
+                # Try 4-bit quantization (BitsAndBytes)
                 try:
                     from transformers import BitsAndBytesConfig
                     bnb_config = BitsAndBytesConfig(
@@ -143,9 +185,8 @@ class LLMEngine:
                         )
                         loaded_successfully = True
                         quant_used = "load_in_4bit=True"
-                        logger.info("Successfully loaded model with load_in_4bit=True.")
                     except Exception as bnb_err2:
-                        logger.warning(f"4-bit load failed ({bnb_err2}). Falling back to native float precision...")
+                        logger.warning(f"4-bit load failed ({bnb_err2}). Falling back to native precision...")
 
                 if not loaded_successfully:
                     self.hf_model = AutoModelForCausalLM.from_pretrained(
@@ -155,7 +196,7 @@ class LLMEngine:
                         trust_remote_code=trust_remote_code,
                     )
                     quant_used = f"Native {compute_dtype}"
-                
+
                 if adapter_path:
                     try:
                         from peft import PeftModel
@@ -163,12 +204,11 @@ class LLMEngine:
                         logger.info(f"Loaded PEFT adapter into HuggingFace model from: {adapter_path}")
                     except Exception as peft_err:
                         raise RuntimeError(f"Failed to load PEFT adapter from '{adapter_path}': {peft_err}")
-                
+
                 self.is_hf_gpu = True
                 logger.info(
                     f"HuggingFace model initialized successfully (Model: {model_name_or_path}, "
-                    f"Adapter: {adapter_path or 'None'}, Quantization: {quant_used}, "
-                    f"Tokenizer: {self.hf_tokenizer.__class__.__name__})."
+                    f"Adapter: {adapter_path or 'None'}, Quantization: {quant_used})."
                 )
             except Exception as e:
                 logger.warning(f"Could not load Hugging Face model on GPU: {e}")
@@ -195,11 +235,8 @@ class LLMEngine:
 
     def _prepare_inputs(self, prompt: str, max_tokens: int = 8192) -> Tuple[Dict[str, Any], int]:
         """
-        Tokenizes on CPU and safely windows the prompt to avoid quadratic attention OOM on 16GB GPUs like Tesla T4.
-        For Qwen 3B, 8192 tokens uses < 3.5GB VRAM (well within 15GB T4 VRAM limit).
-        If prompt > max_tokens, preserves the first 6144 tokens (rules + database schema) + last (max_tokens - 6144) tokens (user question).
+        Tokenizes on CPU and safely windows the prompt to avoid quadratic attention OOM on 16GB GPUs.
         """
-        # 1. Tokenize strictly on CPU first to prevent oversized tensors in GPU VRAM
         inputs = self.hf_tokenizer(prompt, return_tensors="pt")
         total_tokens = inputs["input_ids"].shape[1]
         if total_tokens > max_tokens:
@@ -207,90 +244,95 @@ class LLMEngine:
             keep_user = max_tokens - keep_sys
             logger.info(
                 f"[VRAM Guard] Prompt length ({total_tokens} tokens) exceeds safe threshold ({max_tokens} tokens). "
-                f"Windowing on CPU: keeping first {keep_sys} tokens (rules + schema) + last {keep_user} tokens (user query)."
+                f"Windowing on CPU: keeping first {keep_sys} tokens + last {keep_user} tokens."
             )
             input_ids = torch.cat([inputs["input_ids"][:, :keep_sys], inputs["input_ids"][:, -keep_user:]], dim=1)
             attention_mask = torch.cat([inputs["attention_mask"][:, :keep_sys], inputs["attention_mask"][:, -keep_user:]], dim=1)
             del inputs
             inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
             total_tokens = input_ids.shape[1]
-        
-        # 2. Transfer only the windowed tensors to GPU device
+
         gpu_inputs = {k: v.to(self.hf_model.device) for k, v in inputs.items()}
         del inputs
         return gpu_inputs, total_tokens
 
-    def generate_batch(
+    def generate_samples(
         self,
-        prompts: List[str],
-        temperature: float = 0.0,
-        top_p: float = 0.95,
-        max_new_tokens: int = 1024,
-        stop_tokens: Optional[List[str]] = None,
+        prompts: Union[str, List[str]],
+        n: int = 8,
+        temperature: float = 0.7,
+        max_tokens: int = 512,
+        stop: Optional[List[str]] = None,
     ) -> List[List[str]]:
         """
-        Generates completions for a batch of prompts.
-        Returns a list of completions per prompt.
+        Batch Sampling: Generates n candidate samples for a batch of prompts.
+        In vLLM, uses a SINGLE SamplingParams(n=n, ...) call so all n SQL drafts
+        per question are generated in parallel in one forward pass.
+        Returns List[List[str]]: outer list matches input prompts, inner list has n completions.
         """
+        prompt_list = [prompts] if isinstance(prompts, str) else prompts
+        if not prompt_list:
+            return []
+
+        # 1. vLLM parallel generation
         if self.is_offline_vllm and self.llm is not None:
             sampling_params = SamplingParams(
+                n=n,
                 temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_new_tokens,
-                stop=stop_tokens or ["<|im_end|>"],
+                max_tokens=max_tokens,
+                stop=stop or ["<|im_end|>"],
             )
             outputs = self.llm.generate(
-                prompts,
+                prompt_list,
                 sampling_params=sampling_params,
                 lora_request=self.lora_request,
             )
-            return [[output.outputs[0].text for output in outputs]]
-
-        if self.is_hf_gpu and self.hf_model is not None and self.hf_tokenizer is not None:
-            gc.collect()
-            if HAS_CUDA:
-                torch.cuda.empty_cache()
             results = []
-            for prompt in prompts:
-                inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=8192)
-                do_sample = temperature > 0.0
-                gen_kwargs: Dict[str, Any] = {
-                    "max_new_tokens": max_new_tokens,
-                    "do_sample": do_sample,
-                    "pad_token_id": self.hf_tokenizer.eos_token_id,
-                }
-                if do_sample:
-                    gen_kwargs["temperature"] = temperature
-                    gen_kwargs["top_p"] = top_p
-                with torch.inference_mode():
-                    gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
-                num_generated = gen_tokens.shape[1] - prompt_len
-                if num_generated >= max_new_tokens:
-                    logger.warning(
-                        f"[Generation Truncation Warning] Generated tokens ({num_generated}) reached max_new_tokens ({max_new_tokens}). "
-                        "Completion may be truncated."
-                    )
-                out_text = self.hf_tokenizer.decode(gen_tokens[0][prompt_len:], skip_special_tokens=True)
-                results.append([out_text])
-                del gen_tokens
-                del inputs
-                if HAS_CUDA:
-                    torch.cuda.empty_cache()
+            for out in outputs:
+                results.append([cand.text for cand in out.outputs])
             return results
 
-        # CPU / Fallback Mock Mode
-        fallback_results = []
-        for p in prompts:
-            mock_resp = (
-                "Notes:\n"
-                "- Query sales for valid orders.\n"
-                "TYPE: number\n"
-                "```sql\n"
-                "SELECT COALESCE(ROUND(SUM(line_amount), 0), 0) AS answer FROM v_sales WHERE is_valid_sales = TRUE;\n"
-                "```"
-            )
-            fallback_results.append([mock_resp])
-        return fallback_results
+        # 2. HuggingFace fallback
+        if self.is_hf_gpu and self.hf_model is not None and self.hf_tokenizer is not None:
+            gc.collect()
+            if HAS_CUDA and torch is not None:
+                torch.cuda.empty_cache()
+            all_results = []
+            do_sample = temperature > 0.0
+
+            for prompt in prompt_list:
+                inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=8192)
+                prompt_samples = []
+                for _ in range(n):
+                    gen_kwargs: Dict[str, Any] = {
+                        "max_new_tokens": max_tokens,
+                        "do_sample": do_sample,
+                        "pad_token_id": self.hf_tokenizer.eos_token_id,
+                    }
+                    if do_sample:
+                        gen_kwargs["temperature"] = temperature
+                        gen_kwargs["top_p"] = 0.95
+                    with torch.inference_mode():
+                        gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
+                    out_text = self.hf_tokenizer.decode(gen_tokens[0][prompt_len:], skip_special_tokens=True)
+                    prompt_samples.append(out_text)
+                    del gen_tokens
+                    if HAS_CUDA and torch is not None:
+                        torch.cuda.empty_cache()
+                del inputs
+                all_results.append(prompt_samples)
+            return all_results
+
+        # 3. CPU / Fallback Mock Mode
+        mock_resp = (
+            "Notes:\n"
+            "- Calculation for total amount.\n"
+            "TYPE: number\n"
+            "```sql\n"
+            "SELECT COALESCE(ROUND(SUM(line_amount), 0), 0) AS answer FROM v_sales WHERE is_valid_sales = TRUE;\n"
+            "```"
+        )
+        return [[mock_resp] * n for _ in prompt_list]
 
     def generate_single(
         self,
@@ -302,63 +344,31 @@ class LLMEngine:
     ) -> List[str]:
         """
         Generates n candidate samples for a single prompt.
+        Routes to generate_samples for unified batch sampling.
         """
-        if self.is_offline_vllm and self.llm is not None:
-            sampling_params = SamplingParams(
-                n=n,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_new_tokens,
-                stop=["<|im_end|>"],
-            )
-            outputs = self.llm.generate(
-                [prompt],
-                sampling_params=sampling_params,
-                lora_request=self.lora_request,
-            )
-            return [out.text for out in outputs[0].outputs]
-
-        if self.is_hf_gpu and self.hf_model is not None and self.hf_tokenizer is not None:
-            gc.collect()
-            if HAS_CUDA:
-                torch.cuda.empty_cache()
-            inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=8192)
-            do_sample = temperature > 0.0
-            results = []
-            
-            # Generate one-by-one or in small batches to preserve VRAM on Colab T4
-            for _ in range(n):
-                gen_kwargs: Dict[str, Any] = {
-                    "max_new_tokens": max_new_tokens,
-                    "do_sample": do_sample,
-                    "pad_token_id": self.hf_tokenizer.eos_token_id,
-                }
-                if do_sample:
-                    gen_kwargs["temperature"] = temperature
-                    gen_kwargs["top_p"] = top_p
-                with torch.inference_mode():
-                    gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
-                num_generated = gen_tokens.shape[1] - prompt_len
-                if num_generated >= max_new_tokens:
-                    logger.warning(
-                        f"[Generation Truncation Warning] Generated tokens ({num_generated}) reached max_new_tokens ({max_new_tokens}). "
-                        "Completion may be truncated."
-                    )
-                out_text = self.hf_tokenizer.decode(gen_tokens[0][prompt_len:], skip_special_tokens=True)
-                results.append(out_text)
-                del gen_tokens
-                if HAS_CUDA:
-                    torch.cuda.empty_cache()
-            del inputs
-            return results
-
-        # Fallback Mock Mode
-        mock_resp = (
-            "Notes:\n"
-            "- Calculation for total amount.\n"
-            "TYPE: number\n"
-            "```sql\n"
-            "SELECT COALESCE(ROUND(SUM(line_amount), 0), 0) AS answer FROM v_sales WHERE is_valid_sales = TRUE;\n"
-            "```"
+        samples = self.generate_samples(
+            prompts=[prompt],
+            n=n,
+            temperature=temperature,
+            max_tokens=max_new_tokens,
         )
-        return [mock_resp] * n
+        return samples[0] if samples else []
+
+    def generate_batch(
+        self,
+        prompts: List[str],
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+        max_new_tokens: int = 1024,
+        stop_tokens: Optional[List[str]] = None,
+    ) -> List[List[str]]:
+        """
+        Generates completions for a batch of prompts (1 completion per prompt).
+        """
+        return self.generate_samples(
+            prompts=prompts,
+            n=1,
+            temperature=temperature,
+            max_tokens=max_new_tokens,
+            stop=stop_tokens,
+        )
