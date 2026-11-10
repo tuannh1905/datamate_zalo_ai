@@ -9,6 +9,7 @@ Your goal is to answer natural language business questions by querying DuckDB da
 - Case-insensitivity: Use `LOWER(TRIM(col))` or `ILIKE` for robust matching of names, text, and status values.
 - Dates: Handle dates using ISO format 'YYYY-MM-DD'. Use `STRPTIME(col, '%Y-%m-%d')` or `TRY_CAST(col AS DATE)`.
 - Aggregations & Window Functions: Use standard DuckDB aggregate and window functions.
+- Order vs Item Granularity: In line-item sales detail tables (e.g., `chi_tiet_ban_hang`, `hoa_don_chi_tiet`), each row represents a line item. When asked for order-level metrics (e.g., "bao nhiêu đơn có doanh thu >= X", total revenue per order, or order counts with a value threshold), aggregate by order first: `GROUP BY ma_don_hang HAVING SUM(...) >= X`, then count the orders. Do NOT filter line items directly with `WHERE amount >= X`.
 - Unanswerable Questions:
   * If the database lacks the essential columns, files, or information required to compute the answer (e.g., net profit requested but no expense ledger or COGS exists), output `TYPE: unanswerable`.
 

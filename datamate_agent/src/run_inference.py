@@ -87,6 +87,14 @@ def run_inference_pipeline(
             adapter_path = model_cfg.get("adapter_path", None)
             adapter_source = "Config adapter_path"
 
+    # Fail fast if an explicitly configured adapter is missing
+    if adapter_path and not os.path.exists(adapter_path):
+        if adapter_source in ["CLI override", "Env ADAPTER_DIR", "Config adapter_path"]:
+            raise FileNotFoundError(
+                f"[Configuration Error] Configured LoRA adapter path does not exist: '{adapter_path}' (Source: {adapter_source}). "
+                "Failing fast to prevent running an unintended base model."
+            )
+
     logger.info(f"Loaded Base Model : {model_path} (Source: {model_source})")
     logger.info(f"Loaded Adapter    : {adapter_path or 'None'} (Source: {adapter_source})")
 
@@ -155,10 +163,15 @@ def run_inference_pipeline(
                 log_data = {
                     "id": q_id,
                     "business_id": b_id,
+                    "question": q.get("question", ""),
+                    "as_of_date": q.get("as_of_date", ""),
+                    "model_name": model_path,
+                    "adapter_name": adapter_path or "None",
                     "final_type": "abstain",
                     "final_answer": None,
                     "elapsed_seconds": 0.0,
-                    "abstain_reason": f"Business directory '{b_id}' could not be resolved under '{data_dir}'",
+                    "abstain_reason": f"DATASET_NOT_FOUND: Business directory '{b_id}' could not be resolved under '{data_dir}'",
+                    "failure_category": "DATASET_NOT_FOUND",
                     "candidates": [],
                 }
                 with open(log_path, "w", encoding="utf-8") as f_log:
@@ -241,17 +254,18 @@ def run_inference_pipeline(
                         orig_question=q_text,
                     )
                     candidates.append(c)
-            elif not is_high_conf and cand1.parsed_sql:
+            elif not is_high_conf:
                 # --- TIER 2: In-Context Reflection & Self-Correction ---
-                # Pass 1 failed (Syntax error, duckdb error, NULL output, or type mismatch)
-                # Feed previous SQL + exact error traceback to model for smart self-repair
+                # Pass 1 failed (Syntax error, duckdb error, NULL output, type mismatch, or missing SQL)
                 repair_err = cand1.error or failure_reason or "Query output was invalid or inconsistent with schema"
                 logger.info(f"Question [{q_id}]: Tier 1 failed ({repair_err}). Triggering Tier 2 In-Context Self-Repair...")
-                repaired_sql = voter.repair_sql_turn(cand1.parsed_sql, repair_err, q_text)
+                sql_to_repair = cand1.parsed_sql or "(No SQL query extracted from Tier 1 output)"
+                repaired_sql = voter.repair_sql_turn(sql_to_repair, repair_err, q_text)
                 if repaired_sql:
+                    repair_type = cand1.parsed_type if cand1.parsed_type not in ["failed", "abstain"] else "number"
                     cand_repair = voter.process_candidate(
                         sample_id=1,
-                        raw_completion=f"Notes:\n- [Self-Repaired Query]\nTYPE: {cand1.parsed_type}\n```sql\n{repaired_sql}\n```",
+                        raw_completion=f"Notes:\n- [Self-Repaired Query]\nTYPE: {repair_type}\n```sql\n{repaired_sql}\n```",
                         orig_question=q_text,
                     )
                     if cand_repair.success and cand_repair.vote_key:
@@ -301,9 +315,19 @@ def run_inference_pipeline(
             submission_file.flush()
 
             # Write per-question log to /result/logs/<id>.json
+            log_data = result.to_log_dict()
+            log_data.update({
+                "question": q_text,
+                "as_of_date": as_of_date,
+                "model_name": model_path,
+                "adapter_name": adapter_path or "None",
+                "resolved_business_dir": b_dir,
+                "k_samples": k_samples,
+                "tau": tau,
+            })
             log_path = os.path.join(log_dir, f"{q_id}.json")
             with open(log_path, "w", encoding="utf-8") as f_log:
-                json.dump(result.to_log_dict(), f_log, ensure_ascii=False, indent=2)
+                json.dump(log_data, f_log, ensure_ascii=False, indent=2)
 
             total_processed += 1
 

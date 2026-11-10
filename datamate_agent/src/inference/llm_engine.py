@@ -54,11 +54,19 @@ class LLMEngine:
         self.hf_model = None
         self.hf_tokenizer = None
 
+        # 0. Validate adapter path existence if explicitly configured
+        if adapter_path:
+            if not os.path.exists(adapter_path):
+                raise FileNotFoundError(
+                    f"[LLMEngine Error] Configured LoRA adapter path does not exist: '{adapter_path}'. "
+                    f"Ensure weights/adapters are present or set adapter_path: null."
+                )
+
         # 1. Try vLLM if available
         if HAS_VLLM and (os.path.exists(model_name_or_path) or "/" in model_name_or_path):
             try:
                 logger.info(f"Initializing vLLM engine with model: {model_name_or_path}")
-                enable_lora = bool(adapter_path and os.path.exists(adapter_path))
+                enable_lora = bool(adapter_path)
                 
                 vllm_kwargs: Dict[str, Any] = {
                     "model": model_name_or_path,
@@ -77,8 +85,12 @@ class LLMEngine:
                 self.is_offline_vllm = True
 
                 if enable_lora:
-                    self.lora_request = LoRARequest("datamate_adapter", 1, adapter_path)
-                    logger.info(f"Loaded LoRA adapter from: {adapter_path}")
+                    try:
+                        self.lora_request = LoRARequest("datamate_adapter", 1, adapter_path)
+                        logger.info(f"Loaded LoRA adapter into vLLM from: {adapter_path}")
+                    except Exception as lora_err:
+                        raise RuntimeError(f"Failed to load LoRA adapter into vLLM from '{adapter_path}': {lora_err}")
+                logger.info(f"vLLM engine initialized successfully (Model: {model_name_or_path}, Adapter: {adapter_path or 'None'}).")
             except Exception as e:
                 logger.warning(f"Could not initialize vLLM: {e}")
                 self.llm = None
@@ -101,6 +113,7 @@ class LLMEngine:
                 compute_dtype = torch.bfloat16 if is_ampere_or_later else torch.float16
 
                 loaded_successfully = False
+                quant_used = "None"
                 # Try 4-bit quantization first (essential for T4 16GB GPU)
                 try:
                     from transformers import BitsAndBytesConfig
@@ -117,6 +130,7 @@ class LLMEngine:
                         trust_remote_code=trust_remote_code,
                     )
                     loaded_successfully = True
+                    quant_used = "BitsAndBytes NF4 (4-bit)"
                     logger.info("Successfully loaded model with BitsAndBytes 4-bit (NF4) quantization.")
                 except Exception as bnb_err:
                     logger.warning(f"BitsAndBytes 4-bit load failed or unavailable ({bnb_err}). Trying load_in_4bit=True...")
@@ -128,6 +142,7 @@ class LLMEngine:
                             trust_remote_code=trust_remote_code,
                         )
                         loaded_successfully = True
+                        quant_used = "load_in_4bit=True"
                         logger.info("Successfully loaded model with load_in_4bit=True.")
                     except Exception as bnb_err2:
                         logger.warning(f"4-bit load failed ({bnb_err2}). Falling back to native float precision...")
@@ -139,13 +154,22 @@ class LLMEngine:
                         device_map="auto",
                         trust_remote_code=trust_remote_code,
                     )
+                    quant_used = f"Native {compute_dtype}"
                 
-                if adapter_path and os.path.exists(adapter_path):
-                    from peft import PeftModel
-                    self.hf_model = PeftModel.from_pretrained(self.hf_model, adapter_path)
-                    logger.info(f"Loaded PEFT adapter into HuggingFace model from: {adapter_path}")
+                if adapter_path:
+                    try:
+                        from peft import PeftModel
+                        self.hf_model = PeftModel.from_pretrained(self.hf_model, adapter_path)
+                        logger.info(f"Loaded PEFT adapter into HuggingFace model from: {adapter_path}")
+                    except Exception as peft_err:
+                        raise RuntimeError(f"Failed to load PEFT adapter from '{adapter_path}': {peft_err}")
                 
                 self.is_hf_gpu = True
+                logger.info(
+                    f"HuggingFace model initialized successfully (Model: {model_name_or_path}, "
+                    f"Adapter: {adapter_path or 'None'}, Quantization: {quant_used}, "
+                    f"Tokenizer: {self.hf_tokenizer.__class__.__name__})."
+                )
             except Exception as e:
                 logger.warning(f"Could not load Hugging Face model on GPU: {e}")
                 self.is_hf_gpu = False
@@ -231,7 +255,7 @@ class LLMEngine:
                 inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=8192)
                 do_sample = temperature > 0.0
                 gen_kwargs: Dict[str, Any] = {
-                    "max_new_tokens": min(max_new_tokens, 256),
+                    "max_new_tokens": max_new_tokens,
                     "do_sample": do_sample,
                     "pad_token_id": self.hf_tokenizer.eos_token_id,
                 }
@@ -240,6 +264,12 @@ class LLMEngine:
                     gen_kwargs["top_p"] = top_p
                 with torch.inference_mode():
                     gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
+                num_generated = gen_tokens.shape[1] - prompt_len
+                if num_generated >= max_new_tokens:
+                    logger.warning(
+                        f"[Generation Truncation Warning] Generated tokens ({num_generated}) reached max_new_tokens ({max_new_tokens}). "
+                        "Completion may be truncated."
+                    )
                 out_text = self.hf_tokenizer.decode(gen_tokens[0][prompt_len:], skip_special_tokens=True)
                 results.append([out_text])
                 del gen_tokens
@@ -299,7 +329,7 @@ class LLMEngine:
             # Generate one-by-one or in small batches to preserve VRAM on Colab T4
             for _ in range(n):
                 gen_kwargs: Dict[str, Any] = {
-                    "max_new_tokens": min(max_new_tokens, 256),
+                    "max_new_tokens": max_new_tokens,
                     "do_sample": do_sample,
                     "pad_token_id": self.hf_tokenizer.eos_token_id,
                 }
@@ -308,6 +338,12 @@ class LLMEngine:
                     gen_kwargs["top_p"] = top_p
                 with torch.inference_mode():
                     gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
+                num_generated = gen_tokens.shape[1] - prompt_len
+                if num_generated >= max_new_tokens:
+                    logger.warning(
+                        f"[Generation Truncation Warning] Generated tokens ({num_generated}) reached max_new_tokens ({max_new_tokens}). "
+                        "Completion may be truncated."
+                    )
                 out_text = self.hf_tokenizer.decode(gen_tokens[0][prompt_len:], skip_special_tokens=True)
                 results.append(out_text)
                 del gen_tokens

@@ -251,14 +251,44 @@ def clean_number_series(s: pd.Series) -> pd.Series:
 
 def find_true_header_from_df(df: pd.DataFrame) -> Tuple[int, List[str]]:
     """
-    Detects the true header row index: the first row with >= 3 non-empty cells.
+    Detects the true header row index in Excel/CSV sheets.
+    Handles title banners and multi-level group headers (e.g. Row 0 having few filled cells
+    while Row 1 has all column headers filled).
     """
+    best_idx = 0
+    best_score = -1
+    best_cols = []
+
     for idx in range(min(15, len(df))):
         row = df.iloc[idx]
-        non_empty = [c for c in row if pd.notna(c) and str(c).strip() != "" and str(c).lower() != "nan" and not str(c).startswith("Unnamed:")]
-        if len(non_empty) >= 3:
-            cols = [str(c).strip() if pd.notna(c) and str(c).strip() else f"col_{i}" for i, c in enumerate(row)]
-            return idx, cols
+        non_empty_cells = [
+            str(c).strip() for c in row
+            if pd.notna(c) and str(c).strip() != "" and str(c).lower() != "nan" and not str(c).startswith("Unnamed:")
+        ]
+        count = len(non_empty_cells)
+        if count < 2:
+            continue
+
+        # Check how many cells look like string identifiers/labels rather than dates/numeric data
+        string_count = sum(
+            1 for c in non_empty_cells
+            if not re.match(r"^\d+(\.\d+)?$", c) and not re.match(r"^\d{1,4}[/-]\d{1,2}[/-]\d{1,4}", c)
+        )
+        
+        # If this is predominantly a data row (many numbers or dates), penalty
+        is_likely_data = (count >= 3 and string_count < count * 0.5)
+        if is_likely_data:
+            if best_score > 0:
+                break
+
+        score = count * 2 + string_count * 3
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+            best_cols = [str(c).strip() if pd.notna(c) and str(c).strip() else f"col_{i}" for i, c in enumerate(row)]
+
+    if best_score > 0:
+        return best_idx, best_cols
     return 0, [str(c) for c in df.columns]
 
 
@@ -290,14 +320,22 @@ def drop_subtotal_rows(df: pd.DataFrame) -> pd.DataFrame:
 def clean_date_series(s: pd.Series) -> pd.Series:
     """
     Vectorized normalization of date series to ISO 'YYYY-MM-DD'.
-    Handles formats like 'DD/MM/YYYY', 'YYYY-MM-DD', 'D thg M YYYY', 'D tháng M YYYY'.
+    Handles formats like 'DD/MM/YYYY', 'YYYY-MM-DD', 'D thg M YYYY', 'D tháng M YYYY',
+    as well as Excel integer serial dates (e.g. 45689 -> 2025-02-01).
     """
     if pd.api.types.is_datetime64_any_dtype(s):
         return s.dt.strftime("%Y-%m-%d")
-    
+
+    # 1. Parse Excel numeric serial dates (typical range 35000 - 65000: 1995 to 2075)
+    num_s = pd.to_numeric(s, errors="coerce")
+    excel_mask = num_s.notna() & (num_s >= 35000) & (num_s <= 65000)
+    dt_excel = pd.Series(pd.NaT, index=s.index)
+    if excel_mask.any():
+        dt_excel[excel_mask] = pd.to_datetime(num_s[excel_mask], unit="D", origin="1899-12-30", errors="coerce")
+
     str_s = s.astype(str).str.strip()
     
-    # Check Vietnamese text date: '1 thg 6 2025' or '15 tháng 12 2026'
+    # 2. Check Vietnamese text date: '1 thg 6 2025' or '15 tháng 12 2026'
     extr = str_s.str.extract(r"^(\d{1,2})\s*(?:thg|tháng|thg\.)\s*(\d{1,2})\s*(\d{4})")
     dt_vn = pd.to_datetime(extr[2] + "-" + extr[1] + "-" + extr[0], format="%Y-%m-%d", errors="coerce")
     
@@ -306,7 +344,7 @@ def clean_date_series(s: pd.Series) -> pd.Series:
     dt_dt1 = pd.to_datetime(str_s, format="%Y-%m-%d %H:%M:%S", errors="coerce")
     dt_dt2 = pd.to_datetime(str_s, format="%d/%m/%Y %H:%M:%S", errors="coerce")
     
-    merged_dt = dt_vn.fillna(dt_dmy).fillna(dt_ymd).fillna(dt_dt1).fillna(dt_dt2)
+    merged_dt = dt_excel.fillna(dt_vn).fillna(dt_dmy).fillna(dt_ymd).fillna(dt_dt1).fillna(dt_dt2)
     valid_mask = merged_dt.notna()
     res = str_s.copy()
     res.loc[valid_mask] = merged_dt.loc[valid_mask].dt.strftime("%Y-%m-%d")
@@ -363,9 +401,11 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]
     # 4. Safe type cleaning for dates and numbers
     DATE_KEYWORDS = {"ngay", "date", "thoi_gian", "ngay_lap", "ngay_ct", "ngay_dat", "ngay_ban"}
     AMOUNT_WORDS = {
-        "gia", "don_gia", "gia_ban", "tien", "thanh_tien", "tong_tien",
+        "gia", "don_gia", "gia_ban", "tien", "thanh_tien", "tong_tien", "tien_hang",
         "so_luong", "soluong", "amount", "price", "quantity", "total",
-        "no", "cong_no", "du_no", "chiet_khau", "giam_gia", "thanh_toan"
+        "no", "cong_no", "du_no", "chiet_khau", "giam_gia", "thanh_toan",
+        "can_tra", "phai_tra", "da_tra", "tra", "tri_gia", "gia_tri", "gia_von",
+        "phi", "chi_phi", "thue", "vat", "von"
     }
     EXCLUDE_AMOUNT_WORDS = {"giao_hang", "noi_dung", "noi_giao", "don_vi", "ten"}
 
@@ -387,6 +427,11 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]
                     df[col] = cleaned
                 else:
                     df[col] = orig_series
+        else:
+            # For non-date, non-amount columns that are completely empty / all NaN,
+            # cast to string/VARCHAR with None so DuckDB LOWER(col) won't throw Binder Error: lower(INTEGER/DOUBLE).
+            if df[col].isna().all():
+                df[col] = pd.Series([None] * len(df), dtype=object)
 
     return df, col_mapping
 
@@ -454,6 +499,12 @@ def load_business_data(business_id: str, business_dir: str) -> BusinessContext:
                         {"name": col, "type": str(clean_df[col].dtype), "original": col_map.get(col, col)}
                         for col in clean_df.columns
                     ]
+                    # Also create alias view without raw_ prefix
+                    if tbl_base != tbl_name:
+                        try:
+                            con.execute(f"CREATE VIEW {tbl_base} AS SELECT * FROM {tbl_name}")
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.error(f"Error loading CSV {fname}: {e}")
 
@@ -481,11 +532,39 @@ def load_business_data(business_id: str, business_dir: str) -> BusinessContext:
 
                 if sheet_dfs:
                     first_cols = list(sheet_dfs[0][1].columns)
+                    is_single_sheet = (len(sheet_dfs) == 1)
                     is_homogenous = len(sheet_dfs) > 1 and all(
                         list(s[1].columns) == first_cols for s in sheet_dfs
                     )
 
-                    if is_homogenous:
+                    if is_single_sheet:
+                        sname, sdf = sheet_dfs[0]
+                        clean_df, col_map = preprocess_dataframe(sdf)
+                        tbl_name = f"raw_{tbl_base}"
+                        con.register(f"{tbl_name}_df", clean_df)
+                        con.execute(f"CREATE TABLE {tbl_name} AS SELECT * FROM {tbl_name}_df")
+                        table_names.append(tbl_name)
+                        all_col_mappings[tbl_name] = col_map
+                        schemas[tbl_name] = [
+                            {"name": col, "type": str(clean_df[col].dtype), "original": col_map.get(col, col)}
+                            for col in clean_df.columns
+                        ]
+                        # Alias with sheet name (e.g. raw_..._sheet1)
+                        clean_sname = normalize_identifier(sname)
+                        sheet_alias = f"raw_{tbl_base}_{clean_sname}"
+                        if sheet_alias != tbl_name:
+                            try:
+                                con.execute(f"CREATE VIEW {sheet_alias} AS SELECT * FROM {tbl_name}")
+                            except Exception:
+                                pass
+                        # Alias without raw_ prefix
+                        if tbl_base != tbl_name:
+                            try:
+                                con.execute(f"CREATE VIEW {tbl_base} AS SELECT * FROM {tbl_name}")
+                            except Exception:
+                                pass
+
+                    elif is_homogenous:
                         combined = pd.concat([s[1] for s in sheet_dfs], ignore_index=True)
                         clean_df, col_map = preprocess_dataframe(combined)
                         tbl_name = f"raw_{tbl_base}"
@@ -497,6 +576,20 @@ def load_business_data(business_id: str, business_dir: str) -> BusinessContext:
                             {"name": col, "type": str(clean_df[col].dtype), "original": col_map.get(col, col)}
                             for col in clean_df.columns
                         ]
+                        for sname, _ in sheet_dfs:
+                            clean_sname = normalize_identifier(sname)
+                            sheet_alias = f"raw_{tbl_base}_{clean_sname}"
+                            if sheet_alias != tbl_name:
+                                try:
+                                    con.execute(f"CREATE VIEW {sheet_alias} AS SELECT * FROM {tbl_name}")
+                                except Exception:
+                                    pass
+                        if tbl_base != tbl_name:
+                            try:
+                                con.execute(f"CREATE VIEW {tbl_base} AS SELECT * FROM {tbl_name}")
+                            except Exception:
+                                pass
+
                     else:
                         for sname, sdf in sheet_dfs:
                             clean_df, col_map = preprocess_dataframe(sdf)
@@ -510,6 +603,13 @@ def load_business_data(business_id: str, business_dir: str) -> BusinessContext:
                                 {"name": col, "type": str(clean_df[col].dtype), "original": col_map.get(col, col)}
                                 for col in clean_df.columns
                             ]
+                        base_alias = f"raw_{tbl_base}"
+                        if base_alias not in table_names and sheet_dfs:
+                            first_clean_sname = normalize_identifier(sheet_dfs[0][0])
+                            try:
+                                con.execute(f"CREATE VIEW {base_alias} AS SELECT * FROM raw_{tbl_base}_{first_clean_sname}")
+                            except Exception:
+                                pass
             except Exception as e:
                 print(f"Error loading Excel {fname}: {e}")
 
@@ -538,6 +638,11 @@ def load_business_data(business_id: str, business_dir: str) -> BusinessContext:
                             {"name": col, "type": str(clean_df[col].dtype), "original": col_map.get(col, col)}
                             for col in clean_df.columns
                         ]
+                        if clean_tname != tbl_name:
+                            try:
+                                con.execute(f"CREATE VIEW {clean_tname} AS SELECT * FROM {tbl_name}")
+                            except Exception:
+                                pass
                     except Exception as te:
                         print(f"Error reading SQLite table {s_tbl}: {te}")
                 sq_con.close()

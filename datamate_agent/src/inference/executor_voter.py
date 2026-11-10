@@ -74,8 +74,8 @@ def parse_completion(text: str) -> Tuple[Optional[str], Optional[str]]:
     if not text or not isinstance(text, str):
         return None, None
 
-    # 1. Extract TYPE: find all occurrences of ^TYPE:\s*([a-zA-Z_]+) at start of lines
-    type_matches = list(re.finditer(r"(?im)^TYPE:\s*([a-zA-Z_]+)", text))
+    # 1. Extract TYPE: find all occurrences of TYPE: at start of lines, allowing markdown bolding
+    type_matches = list(re.finditer(r"(?im)^\s*(?:\*\*)?(?:\[)?TYPE(?:\])?(?::(?:\*\*)?|(?:\*\*)?:)\s*([a-zA-Z_]+)", text))
     pred_type: Optional[str] = None
     type_pos = -1
     if type_matches:
@@ -85,39 +85,42 @@ def parse_completion(text: str) -> Tuple[Optional[str], Optional[str]]:
             pred_type = raw_type
             type_pos = last_match.end()
 
-    # 2. Extract SQL block: only search after the last TYPE line (if found), or whole text
+    # 2. Extract SQL block: search after the last TYPE line first, or entire text if not found
     search_region = text[type_pos:] if type_pos >= 0 else text
     sql: Optional[str] = None
 
-    # Check for closed ```sql ... ```
-    closed_blocks = list(re.finditer(r"```(?:sql)?\s*([\s\S]*?)\s*```", search_region, re.IGNORECASE))
-    if closed_blocks:
-        for blk in closed_blocks:
-            cand = blk.group(1).strip()
-            if re.search(r"(?i)^\s*(?:WITH|SELECT)\b", cand):
-                sql = cand
-                break
-        if not sql:
-            sql = closed_blocks[0].group(1).strip()
+    def _extract_sql_from_region(region: str) -> Optional[str]:
+        # Check for closed ```sql ... ```
+        closed_blocks = list(re.finditer(r"```(?:sql)?\s*([\s\S]*?)\s*```", region, re.IGNORECASE))
+        if closed_blocks:
+            for blk in closed_blocks:
+                cand = blk.group(1).strip()
+                if re.search(r"(?i)^\s*(?:WITH|SELECT)\b", cand):
+                    return cand
+            return closed_blocks[0].group(1).strip()
 
-    # If no closed block found, check for unclosed ```sql ... to end of text
-    if not sql:
-        unclosed_match = re.search(r"```(?:sql)?\s*([\s\S]+)$", search_region, re.IGNORECASE)
+        # Check for unclosed ```sql ... to end of text
+        unclosed_match = re.search(r"```(?:sql)?\s*([\s\S]+)$", region, re.IGNORECASE)
         if unclosed_match:
             cand = unclosed_match.group(1).strip()
             cand = re.sub(r"```.*$", "", cand).strip()
-            sql = cand
+            return cand
 
-    # If still no markdown block found, fallback to first WITH or SELECT query
-    if not sql:
-        with_match = re.search(r"(?is)\b(WITH\b[\s\S]+)", search_region)
-        select_match = re.search(r"(?is)\b(SELECT\b[\s\S]+)", search_region)
+        # Fallback to first WITH or SELECT query
+        with_match = re.search(r"(?is)\b(WITH\b[\s\S]+)", region)
+        select_match = re.search(r"(?is)\b(SELECT\b[\s\S]+)", region)
         if with_match and select_match:
-            sql = with_match.group(1).strip() if with_match.start() < select_match.start() else select_match.group(1).strip()
+            return with_match.group(1).strip() if with_match.start() < select_match.start() else select_match.group(1).strip()
         elif with_match:
-            sql = with_match.group(1).strip()
+            return with_match.group(1).strip()
         elif select_match:
-            sql = select_match.group(1).strip()
+            return select_match.group(1).strip()
+        return None
+
+    sql = _extract_sql_from_region(search_region)
+    # If no SQL found after TYPE line, search the whole text
+    if not sql and type_pos >= 0:
+        sql = _extract_sql_from_region(text)
 
     if sql:
         sql = sql.strip().rstrip(";")
@@ -264,6 +267,7 @@ class CandidateExecution:
     vote_key: Optional[str] = None
     success: bool = False
     error: Optional[str] = None
+    failure_category: Optional[str] = None
     repair_turns: int = 0
 
 
@@ -316,6 +320,7 @@ class QuestionInferenceResult:
             "agreement_count": self.agreement_count,
             "total_samples": self.total_samples,
             "vote_distribution": self.vote_distribution,
+            "abstain_reason": self.reason,
             "generated_sql_samples": [
                 {
                     "sample_id": c.sample_id,
@@ -324,6 +329,8 @@ class QuestionInferenceResult:
                     "success": c.success,
                     "vote_key": c.vote_key,
                     "error": c.error,
+                    "failure_category": c.failure_category,
+                    "repair_turns": c.repair_turns,
                 }
                 for c in self.candidates
             ],
@@ -405,6 +412,13 @@ class ExecutorVoter:
 
         from ..context.prompt_builder import build_chat_prompt
         compact_schema = self.schema_summary or ""
+        
+        # Check if DuckDB gave a table suggestion: e.g. Did you mean "xyz"?
+        hint = ""
+        m_sugg = re.search(r'Did you mean "([^"]+)"\?', error_msg)
+        if m_sugg:
+            hint = f"\nHint from DuckDB: Did you mean table '{m_sugg.group(1)}'?"
+
         messages = [
             {
                 "role": "system",
@@ -419,7 +433,7 @@ class ExecutorVoter:
                 "content": (
                     f"The following DuckDB SQL query produced an error:\n"
                     f"```sql\n{bad_sql}\n```\n\n"
-                    f"DuckDB Error:\n{error_msg}\n\n"
+                    f"DuckDB Error:\n{error_msg}{hint}\n\n"
                     f"Question:\n{orig_question}\n\n"
                     + (f"Database Tables & Columns:\n{compact_schema}\n\n" if compact_schema else "")
                     + "Please fix the SQL query to resolve the error and answer the question. Output ONLY ```sql ... ```."
@@ -439,12 +453,16 @@ class ExecutorVoter:
                 max_new_tokens=512,
             )
             if completions:
-                raw_out = completions[0]
-                if not raw_out.strip().startswith("```"):
-                    raw_out = "```sql\n" + raw_out
+                raw_out = completions[0].strip()
+                if not raw_out.startswith("```"):
+                    raw_out = f"```sql\n{raw_out}\n```"
                 _, rep_sql = parse_completion(raw_out)
+                if not rep_sql:
+                    m = re.search(r"(?is)\b(WITH|SELECT)\b[\s\S]+", raw_out)
+                    if m:
+                        rep_sql = m.group(0).split("```")[0].strip()
                 if rep_sql:
-                    rep_sql = re.sub(r"```.*$", "", rep_sql).strip().rstrip(";")
+                    rep_sql = rep_sql.strip().rstrip(";")
                 return rep_sql
         except Exception as e:
             logger.debug(f"Repair turn failed: {e}")
@@ -470,6 +488,7 @@ class ExecutorVoter:
                 parsed_sql=sql,
                 success=False,
                 error="Missing or invalid TYPE in completion",
+                failure_category="OUTPUT_PARSE_ERROR",
             )
 
         if pred_type == "unanswerable":
@@ -482,6 +501,7 @@ class ExecutorVoter:
                 normalized_value=None,
                 vote_key="unanswerable:__null__",
                 success=True,
+                failure_category="SUCCESS",
             )
 
         if not sql:
@@ -492,11 +512,13 @@ class ExecutorVoter:
                 parsed_sql=None,
                 success=False,
                 error="No SQL query found",
+                failure_category="SQL_EXTRACTION_ERROR",
             )
 
         current_sql = sql
         success = False
         last_error = None
+        failure_cat = None
         rows = None
         col_names = []
         repair_count = 0
@@ -509,10 +531,12 @@ class ExecutorVoter:
                     success = True
                     rows = res_rows
                     col_names = cols
+                    failure_cat = "SUCCESS"
                     break
                 else:
                     # Query executed but produced NULL or 0 rows
                     last_error = f"Query executed successfully but returned NULL or empty output for TYPE '{pred_type}'"
+                    failure_cat = "EMPTY_RESULT"
                     if turn < self.max_repairs:
                         rep = self.repair_sql_turn(current_sql, last_error, orig_question)
                         if rep:
@@ -522,6 +546,7 @@ class ExecutorVoter:
                     break
             else:
                 last_error = err
+                failure_cat = "SQL_EXECUTION_ERROR"
                 if turn < self.max_repairs:
                     rep = self.repair_sql_turn(current_sql, err, orig_question)
                     if rep:
@@ -533,7 +558,6 @@ class ExecutorVoter:
         if success and rows is not None:
             norm_val = cast_duckdb_result(rows, pred_type, col_names, sql=current_sql)
             if norm_val is None:
-                # P0-6: Empty or NULL result is treated as FAILURE, not converted to 0
                 return CandidateExecution(
                     sample_id=sample_id,
                     raw_completion=raw_completion,
@@ -544,6 +568,7 @@ class ExecutorVoter:
                     vote_key=None,
                     success=False,
                     error=f"Query returned NULL or empty result for type '{pred_type}'",
+                    failure_category="EMPTY_RESULT",
                     repair_turns=repair_count,
                 )
 
@@ -557,6 +582,7 @@ class ExecutorVoter:
                 normalized_value=norm_val,
                 vote_key=v_key,
                 success=True,
+                failure_category="SUCCESS",
                 repair_turns=repair_count,
             )
         else:
@@ -567,6 +593,7 @@ class ExecutorVoter:
                 parsed_sql=current_sql,
                 success=False,
                 error=last_error,
+                failure_category=failure_cat or "SQL_EXECUTION_ERROR",
                 repair_turns=repair_count,
             )
 
@@ -585,6 +612,8 @@ class ExecutorVoter:
         total_valid = len(valid_candidates)
 
         if total_valid == 0:
+            first_err = candidates[0].error if candidates else "No candidates"
+            cat = candidates[0].failure_category if candidates else "FINAL_ABSTENTION"
             return QuestionInferenceResult(
                 question_id=question_id,
                 business_id=business_id,
@@ -596,7 +625,7 @@ class ExecutorVoter:
                 elapsed_time=elapsed,
                 candidates=candidates,
                 vote_distribution={},
-                reason="All candidate SQL queries failed execution or returned NULL/empty",
+                reason=f"All candidate SQL queries failed ({cat}): {first_err}",
             )
 
         key_counts = Counter(c.vote_key for c in valid_candidates)
@@ -641,5 +670,5 @@ class ExecutorVoter:
                 elapsed_time=elapsed,
                 candidates=candidates,
                 vote_distribution=dict(key_counts),
-                reason=f"Top answer agreement ({top_count}/{len(candidates)} = {share:.2f}) < tau={self.tau}",
+                reason=f"Voting agreement insufficient ({top_count}/{len(candidates)} = {share:.2f}) < tau={self.tau}",
             )
