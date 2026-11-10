@@ -245,16 +245,19 @@ class LLMEngine:
     def _prepare_inputs(self, prompt: str, max_tokens: Optional[int] = None) -> Tuple[Dict[str, Any], int]:
         """
         Tokenizes on CPU and safely windows the prompt to avoid quadratic attention OOM on 16GB GPUs.
+        Prioritizes the User Prompt (Database Schema, Tables, and Question) at the tail.
         """
         target_max = max_tokens or getattr(self, "hf_max_prompt_tokens", 3584)
         inputs = self.hf_tokenizer(prompt, return_tensors="pt")
         total_tokens = inputs["input_ids"].shape[1]
         if total_tokens > target_max:
-            keep_sys = int(target_max * 0.55)
+            # User prompt (containing Database Schema and Question) is at the tail of the prompt.
+            # Preserve 80% of budget for User Prompt (Schema + Question) and 20% for Core System Rules.
+            keep_sys = min(int(target_max * 0.20), 700)
             keep_user = target_max - keep_sys
             logger.info(
                 f"[VRAM Guard] Prompt length ({total_tokens} tokens) exceeds safe threshold ({target_max} tokens). "
-                f"Windowing on CPU: keeping first {keep_sys} tokens + last {keep_user} tokens."
+                f"Windowing on CPU: keeping first {keep_sys} tokens + last {keep_user} tokens (schema & question preserved)."
             )
             input_ids = torch.cat([inputs["input_ids"][:, :keep_sys], inputs["input_ids"][:, -keep_user:]], dim=1)
             attention_mask = torch.cat([inputs["attention_mask"][:, :keep_sys], inputs["attention_mask"][:, -keep_user:]], dim=1)
@@ -311,6 +314,29 @@ class LLMEngine:
             do_sample = temperature > 0.0
             max_seq = getattr(self, "hf_max_prompt_tokens", 3584)
 
+            # Stopping criteria to halt generation immediately when SQL block finishes
+            stopping_criteria_cls = None
+            try:
+                from transformers import StoppingCriteria, StoppingCriteriaList
+
+                class SQLBlockClosingCriteria(StoppingCriteria):
+                    def __init__(self, tokenizer, prompt_length):
+                        super().__init__()
+                        self.tokenizer = tokenizer
+                        self.prompt_length = prompt_length
+                        self.stop_patterns = ["```\n", "```\r\n", "``` "]
+
+                    def __call__(self, input_ids: Any, scores: Any, **kwargs) -> bool:
+                        new_ids = input_ids[0, self.prompt_length:]
+                        if len(new_ids) < 20:
+                            return False
+                        tail = self.tokenizer.decode(new_ids[-6:], skip_special_tokens=False)
+                        return any(p in tail for p in self.stop_patterns)
+
+                stopping_criteria_cls = SQLBlockClosingCriteria
+            except Exception:
+                stopping_criteria_cls = None
+
             for prompt in prompt_list:
                 inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=max_seq)
                 prompt_samples = []
@@ -324,6 +350,14 @@ class LLMEngine:
                     if do_sample:
                         gen_kwargs["temperature"] = temperature
                         gen_kwargs["top_p"] = 0.95
+                    if stopping_criteria_cls is not None:
+                        try:
+                            from transformers import StoppingCriteriaList
+                            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
+                                stopping_criteria_cls(self.hf_tokenizer, prompt_len)
+                            ])
+                        except Exception:
+                            pass
                     
                     try:
                         with torch.inference_mode():

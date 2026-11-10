@@ -53,7 +53,7 @@ def build_chat_prompt(
     return "\n".join(parts)
 
 
-FEW_SHOT_EXAMPLES = """
+FEW_SHOT_EX1 = """
 Example 1 (Doanh thu tháng này - number):
 Question: "doanh thu tháng này của quán là bao nhiêu?"
 Date Anchors: Tháng này: từ 2026-08-01 đến 2026-08-20.
@@ -68,7 +68,9 @@ FROM don_hang_chi_tiet
 WHERE TRY_CAST(ngay AS DATE) BETWEEN '2026-08-01' AND '2026-08-20'
   AND LOWER(trang_thai) NOT IN ('huỷ', 'trả hàng');
 ```
+""".strip()
 
+FEW_SHOT_EX2 = """
 Example 2 (Tỉ lệ tăng trưởng doanh thu so với kỳ trước - percent):
 Question: "doanh thu tuần này tăng hay giảm bao nhiêu % so với tuần trước?"
 Date Anchors: Tuần này: 2026-05-11 đến 2026-05-15. Tuần trước: 2026-05-04 đến 2026-05-10.
@@ -93,7 +95,9 @@ rev_last AS (
 SELECT ROUND(((rev_this.val - rev_last.val) / NULLIF(rev_last.val, 0)) * 100.0, 2) AS answer
 FROM rev_this, rev_last;
 ```
+""".strip()
 
+FEW_SHOT_EX3 = """
 Example 3 (Top 3 mặt hàng bán chạy nhất - list):
 Question: "top 3 món bán chạy nhất tháng 7/2026 là những món nào?"
 Date Anchors: Tháng 7/2026: 2026-07-01 đến 2026-07-31.
@@ -111,7 +115,9 @@ GROUP BY ten_san_pham, ma_san_pham
 ORDER BY SUM(so_luong) DESC, ma_san_pham ASC
 LIMIT 3;
 ```
+""".strip()
 
+FEW_SHOT_EX4 = """
 Example 4 (Câu không trả lời được - unanswerable):
 Question: "lợi nhuận ròng của cửa hàng trong tháng 5/2026 là bao nhiêu?"
 Date Anchors: Tháng 5/2026: 2026-05-01 đến 2026-05-31.
@@ -123,6 +129,64 @@ TYPE: unanswerable
 SELECT NULL AS answer;
 ```
 """.strip()
+
+FEW_SHOT_EXAMPLES = f"{FEW_SHOT_EX1}\n\n{FEW_SHOT_EX2}\n\n{FEW_SHOT_EX3}\n\n{FEW_SHOT_EX4}"
+
+
+def select_curated_few_shots(question: str) -> str:
+    """
+    Selects 2 most relevant few-shots based on question keywords to keep token usage compact.
+    """
+    q_lower = (question or "").lower()
+    if any(w in q_lower for w in ["top", "bán chạy", "xếp hạng", "nhiều nhất", "ít nhất", "bán được bao nhiêu"]):
+        return f"{FEW_SHOT_EX3}\n\n{FEW_SHOT_EX4}"
+    elif any(w in q_lower for w in ["%", "phần trăm", "tăng", "giảm", "tăng trưởng", "so với"]):
+        return f"{FEW_SHOT_EX2}\n\n{FEW_SHOT_EX4}"
+    else:
+        return f"{FEW_SHOT_EX1}\n\n{FEW_SHOT_EX4}"
+
+
+def filter_rulebook_for_question(rulebook_text: str, question: Optional[str] = None) -> str:
+    """
+    Extracts relevant sections of rulebook.md based on question keywords,
+    always including core rules (as_of_date, revenue, time, unanswerable),
+    while dropping non-SQL sections (file format documentation & grader scoring formulas).
+    """
+    if not rulebook_text:
+        return "Apply standard DataMate business rules: Revenue excludes cancelled & returned orders."
+
+    import re
+    sections = re.split(r'\n(?=##\s+\d+\.)', rulebook_text)
+    if len(sections) < 3:
+        return re.sub(r"\n{3,}", "\n\n", rulebook_text).strip()
+
+    # Core sections always included: Section 0 (Header), Section 1 (Revenue), Section 2 (Time), Section 7 (Unanswerable)
+    selected = [sections[0]]
+    if len(sections) > 1:
+        selected.append(sections[1])  # Doanh thu
+    if len(sections) > 2:
+        selected.append(sections[2])  # Thời gian
+    if len(sections) > 7:
+        selected.append(sections[7])  # Không trả lời được
+
+    q_lower = (question or "").lower()
+
+    if question:
+        if any(w in q_lower for w in ["xếp hạng", "bán chạy", "top", "nhiều nhất", "ít nhất", "bán được bao nhiêu"]) and len(sections) > 3:
+            selected.append(sections[3])
+        if any(w in q_lower for w in ["nợ", "công nợ", "tuổi nợ", "trả nợ", "thu nợ"]) and len(sections) > 4:
+            selected.append(sections[4])
+        if any(w in q_lower for w in ["kho", "tồn", "nhập", "giá vốn", "lãi", "lợi nhuận", "lãi gộp", "lãi ròng"]) and len(sections) > 5:
+            selected.append(sections[5])
+        if any(w in q_lower for w in ["cà phê", "size", "thuốc", "kê đơn", "hoạt chất", "lô", "hạn dùng", "vật liệu", "đợt giao"]) and len(sections) > 6:
+            selected.append(sections[6])
+    else:
+        for idx in [3, 4, 5, 6]:
+            if len(sections) > idx:
+                selected.append(sections[idx])
+
+    merged = "\n\n".join(s.strip() for s in selected)
+    return re.sub(r"\n{3,}", "\n\n", merged).strip()
 
 
 class PromptBuilder:
@@ -184,9 +248,11 @@ class PromptBuilder:
     ) -> str:
         """
         Builds static SYSTEM prompt: sql_rules_system.txt + split's rulebook.md.
-        100% shared across ALL questions in the split for maximum vLLM prefix cache hit.
+        Filters out non-SQL documentation (file formats & grader formulas).
+        If question is provided, extracts topic-relevant business rules.
         """
-        rulebook_text = self.get_rulebook_content(runtime_rulebook_path)
+        raw_rulebook = self.get_rulebook_content(runtime_rulebook_path)
+        rulebook_text = filter_rulebook_for_question(raw_rulebook, question)
         return self.system_template.format(rulebook_content=rulebook_text)
 
     def build_shop_static_prefix(
@@ -282,7 +348,7 @@ class PromptBuilder:
             "===================================================================",
             "6. FEW-SHOT EXAMPLES (SIMILAR QUESTIONS)",
             "===================================================================",
-            FEW_SHOT_EXAMPLES,
+            select_curated_few_shots(question),
             "",
             "===================================================================",
             "7. CURRENT QUESTION & HINTS",
