@@ -59,9 +59,8 @@ Question: "doanh thu tháng này của quán là bao nhiêu?"
 Date Anchors: Tháng này: từ 2026-08-01 đến 2026-08-20.
 Notes:
 - [Entity & Time analysis]: Target is total sales revenue for 'tháng này' (2026-08-01 to 2026-08-20).
-- [Logic & Formulas]: Refer to Business Rulebook for revenue definitions and status filters. Sum of valid order line amounts.
-- [Database Schema Matching]: Query the actual tables present in the database schema (e.g. don_hang_chi_tiet or raw sales tables).
-- [Output Type]: number (integer VND).
+- [Logic & Formulas]: Sum line amounts excluding cancelled/returned orders. Round to integer VND.
+- [Output Type]: number
 TYPE: number
 ```sql
 SELECT ROUND(SUM(thanh_tien), 0) AS answer
@@ -75,8 +74,8 @@ Question: "doanh thu tuần này tăng hay giảm bao nhiêu % so với tuần t
 Date Anchors: Tuần này: 2026-05-11 đến 2026-05-15. Tuần trước: 2026-05-04 đến 2026-05-10.
 Notes:
 - [Entity & Time analysis]: Compare revenue of this week vs last week.
-- [Logic & Formulas]: Refer to Business Rulebook for growth calculation formula: ((Rev_this - Rev_last) / Rev_last) * 100. Round to 2 decimal places.
-- [Output Type]: percent.
+- [Logic & Formulas]: Growth formula: ((Rev_this - Rev_last) / Rev_last) * 100. Round to 2 decimals.
+- [Output Type]: percent
 TYPE: percent
 ```sql
 WITH rev_this AS (
@@ -100,8 +99,8 @@ Question: "top 3 món bán chạy nhất tháng 7/2026 là những món nào?"
 Date Anchors: Tháng 7/2026: 2026-07-01 đến 2026-07-31.
 Notes:
 - [Entity & Time analysis]: Top 3 best selling items in July 2026.
-- [Logic & Formulas]: Refer to Business Rulebook for sales volume ranking metric (total quantity descending) and tie-breaking order (item ID ascending).
-- [Output Type]: list.
+- [Logic & Formulas]: Total quantity base DESC, tie-breaker product_id ASC.
+- [Output Type]: list
 TYPE: list
 ```sql
 SELECT ten_san_pham
@@ -117,12 +116,10 @@ Example 4 (Câu không trả lời được - unanswerable):
 Question: "lợi nhuận ròng của cửa hàng trong tháng 5/2026 là bao nhiêu?"
 Date Anchors: Tháng 5/2026: 2026-05-01 đến 2026-05-31.
 Notes:
-- [Entity & Time analysis]: Question asks for 'lợi nhuận ròng' (net profit).
-- [Logic & Formulas]: Net profit requires operating costs or COGS data according to the Business Rulebook. The database tables do not contain cost/expense columns or tables. Missing essential data to compute answer.
-- [Output Type]: unanswerable.
+- [Entity & Time analysis]: Net profit requested but database lacks expense ledger/cost tables.
+- [Output Type]: unanswerable
 TYPE: unanswerable
 ```sql
--- Unanswerable: Database lacks expense log / cost data required to compute net profit
 SELECT NULL AS answer;
 ```
 """.strip()
@@ -167,13 +164,17 @@ class PromptBuilder:
                     sha1 = hashlib.sha1(f.read()).hexdigest()
                 logger.info(f"Loaded Runtime Rulebook from '{path}' (SHA1: {sha1})")
                 with open(path, "r", encoding="utf-8") as f:
-                    return f.read()
+                    content = f.read()
             except Exception:
                 try:
                     with open(path, "r", encoding="latin1") as f:
-                        return f.read()
+                        content = f.read()
                 except Exception:
-                    pass
+                    content = ""
+            if content:
+                import re
+                cleaned = re.sub(r"\n{3,}", "\n\n", content).strip()
+                return cleaned
         return "Apply standard DataMate business rules: Revenue excludes cancelled & returned orders."
 
     def build_system_prompt(
@@ -204,8 +205,8 @@ class PromptBuilder:
         100% shared across all questions of the same business_id.
         """
         readme = ctx.readme_text.strip()
-        if len(readme) > 1000:
-            readme = readme[:1000] + "\n...[truncated]"
+        if len(readme) > 600:
+            readme = readme[:600] + "\n...[truncated]"
         if not readme:
             readme = "No README provided."
 

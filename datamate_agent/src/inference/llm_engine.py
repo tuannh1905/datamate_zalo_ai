@@ -11,8 +11,8 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Set PyTorch allocation conf to avoid VRAM fragmentation and virtual memory mapping errors on Colab T4
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+# Set PyTorch allocation conf to avoid VRAM fragmentation and virtual memory mapping errors on Colab T4/L4
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 logger = logging.getLogger(__name__)
 
@@ -67,37 +67,46 @@ class LLMEngine:
                     f"Ensure weights/adapters are present or set adapter_path: null."
                 )
 
+        # Auto-detect GPU VRAM once globally
+        self.is_low_vram = False
+        self.vram_gb = 0.0
+        if HAS_CUDA and torch is not None and torch.cuda.is_available():
+            try:
+                total_vram = torch.cuda.get_device_properties(0).total_memory
+                self.vram_gb = total_vram / (1024 ** 3)
+                logger.info(f"[GPU Auto-Detect] Device: {torch.cuda.get_device_name(0)}, Total VRAM: {self.vram_gb:.2f} GB")
+                if self.vram_gb < 18.0:
+                    self.is_low_vram = True
+                    logger.info(f"[VRAM Guard] VRAM < 18GB (e.g. Colab T4). Applying low-memory configuration.")
+            except Exception as e:
+                logger.warning(f"Failed to check GPU memory: {e}")
+
+        # Safe prompt context limit for HuggingFace Transformers
+        if self.is_low_vram:
+            self.hf_max_prompt_tokens = 3584
+        elif self.vram_gb >= 18.0:
+            self.hf_max_prompt_tokens = 7168
+        else:
+            self.hf_max_prompt_tokens = 4096
+
         # 1. Try vLLM if available
         if HAS_VLLM and (os.path.exists(model_name_or_path) or "/" in model_name_or_path):
             try:
                 logger.info(f"Initializing vLLM engine with model: {model_name_or_path}")
 
-                # Auto-detect GPU VRAM
-                is_low_vram = False
-                vram_gb = 0.0
-                if HAS_CUDA and torch.cuda.is_available():
-                    try:
-                        total_vram = torch.cuda.get_device_properties(0).total_memory
-                        vram_gb = total_vram / (1024 ** 3)
-                        logger.info(f"[GPU Auto-Detect] Device: {torch.cuda.get_device_name(0)}, Total VRAM: {vram_gb:.2f} GB")
-                        if vram_gb < 18.0:
-                            is_low_vram = True
-                            logger.info(f"[VRAM Guard] VRAM < 18GB (e.g. Colab T4). Forcing dtype='half' and 4-bit quantization.")
-                    except Exception as e:
-                        logger.warning(f"Failed to check GPU memory: {e}")
-
+                vllm_max_len = min(self.max_model_len, 8192) if self.is_low_vram else self.max_model_len
                 vllm_kwargs: Dict[str, Any] = {
                     "model": model_name_or_path,
                     "tensor_parallel_size": tensor_parallel_size,
                     "gpu_memory_utilization": gpu_memory_utilization,
-                    "max_model_len": self.max_model_len,
+                    "max_model_len": vllm_max_len,
                     "enable_prefix_caching": True,  # Critical for 14k prefix reuse
                     "trust_remote_code": trust_remote_code,
                     "enable_lora": True,  # Support dynamic LoRA loading
                     "max_lora_rank": 16,
                 }
 
-                if is_low_vram:
+                if self.is_low_vram:
                     vllm_kwargs["dtype"] = "half"
                     chosen_quant = quantization or "bitsandbytes"
                     vllm_kwargs["quantization"] = chosen_quant
@@ -233,17 +242,18 @@ class LLMEngine:
             return self.hf_tokenizer
         return None
 
-    def _prepare_inputs(self, prompt: str, max_tokens: int = 8192) -> Tuple[Dict[str, Any], int]:
+    def _prepare_inputs(self, prompt: str, max_tokens: Optional[int] = None) -> Tuple[Dict[str, Any], int]:
         """
         Tokenizes on CPU and safely windows the prompt to avoid quadratic attention OOM on 16GB GPUs.
         """
+        target_max = max_tokens or getattr(self, "hf_max_prompt_tokens", 3584)
         inputs = self.hf_tokenizer(prompt, return_tensors="pt")
         total_tokens = inputs["input_ids"].shape[1]
-        if total_tokens > max_tokens:
-            keep_sys = 6144
-            keep_user = max_tokens - keep_sys
+        if total_tokens > target_max:
+            keep_sys = int(target_max * 0.55)
+            keep_user = target_max - keep_sys
             logger.info(
-                f"[VRAM Guard] Prompt length ({total_tokens} tokens) exceeds safe threshold ({max_tokens} tokens). "
+                f"[VRAM Guard] Prompt length ({total_tokens} tokens) exceeds safe threshold ({target_max} tokens). "
                 f"Windowing on CPU: keeping first {keep_sys} tokens + last {keep_user} tokens."
             )
             input_ids = torch.cat([inputs["input_ids"][:, :keep_sys], inputs["input_ids"][:, -keep_user:]], dim=1)
@@ -299,28 +309,55 @@ class LLMEngine:
                 torch.cuda.empty_cache()
             all_results = []
             do_sample = temperature > 0.0
+            max_seq = getattr(self, "hf_max_prompt_tokens", 3584)
 
             for prompt in prompt_list:
-                inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=8192)
+                inputs, prompt_len = self._prepare_inputs(prompt, max_tokens=max_seq)
                 prompt_samples = []
-                for _ in range(n):
+                for sample_idx in range(n):
                     gen_kwargs: Dict[str, Any] = {
                         "max_new_tokens": max_tokens,
                         "do_sample": do_sample,
                         "pad_token_id": self.hf_tokenizer.eos_token_id,
+                        "use_cache": True,
                     }
                     if do_sample:
                         gen_kwargs["temperature"] = temperature
                         gen_kwargs["top_p"] = 0.95
-                    with torch.inference_mode():
-                        gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
-                    out_text = self.hf_tokenizer.decode(gen_tokens[0][prompt_len:], skip_special_tokens=True)
-                    prompt_samples.append(out_text)
-                    del gen_tokens
+                    
+                    try:
+                        with torch.inference_mode():
+                            gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
+                        out_text = self.hf_tokenizer.decode(gen_tokens[0][prompt_len:], skip_special_tokens=True)
+                        prompt_samples.append(out_text)
+                        del gen_tokens
+                    except torch.cuda.OutOfMemoryError as oom_err:
+                        logger.warning(
+                            f"[CUDA OOM Guard] OOM during sample {sample_idx+1}/{n}: {oom_err}. "
+                            f"Flushing GPU cache and generating emergency fallback."
+                        )
+                        gc.collect()
+                        if HAS_CUDA and torch is not None:
+                            torch.cuda.empty_cache()
+                        fallback_completion = (
+                            "Notes:\n"
+                            "- [CUDA OOM Guard]: Memory limit reached.\n"
+                            "TYPE: unanswerable\n"
+                            "```sql\n"
+                            "SELECT NULL AS answer;\n"
+                            "```"
+                        )
+                        prompt_samples.append(fallback_completion)
+
                     if HAS_CUDA and torch is not None:
                         torch.cuda.empty_cache()
+
                 del inputs
+                gc.collect()
+                if HAS_CUDA and torch is not None:
+                    torch.cuda.empty_cache()
                 all_results.append(prompt_samples)
+
             return all_results
 
         # 3. CPU / Fallback Mock Mode

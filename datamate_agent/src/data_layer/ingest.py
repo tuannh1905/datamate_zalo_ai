@@ -50,21 +50,21 @@ class BusinessContext:
 
             # Fetch compact sample rows (truncated to prevent VRAM explosion on large tables)
             try:
-                raw_samples = self.con.execute(f"SELECT * FROM {tbl} LIMIT 2").fetchall()
+                raw_samples = self.con.execute(f"SELECT * FROM {tbl} LIMIT 1").fetchall()
                 compact_samples = []
                 for row in raw_samples:
                     compact_row = tuple(
-                        (str(v)[:30] + "...") if isinstance(v, str) and len(str(v)) > 30 else v
+                        (str(v)[:20] + "...") if isinstance(v, str) and len(str(v)) > 20 else v
                         for v in row
                     )
                     compact_samples.append(compact_row)
-                sample_str = f"Sample rows ({len(compact_samples)}): {compact_samples}"
-                if len(sample_str) > 300:
-                    sample_str = sample_str[:300] + "...]"
+                sample_str = f"Sample row: {compact_samples[0]}" if compact_samples else ""
+                if len(sample_str) > 200:
+                    sample_str = sample_str[:200] + "...)"
             except Exception:
                 sample_str = ""
 
-            lines.append(f"Table `{tbl}`:\n" + "\n".join(col_desc) + f"\n{sample_str}\n")
+            lines.append(f"Table `{tbl}`:\n" + "\n".join(col_desc) + (f"\n{sample_str}\n" if sample_str else "\n"))
 
         # Auto-detect table relationships & join hints
         rel_hints = []
@@ -106,7 +106,9 @@ class BusinessContext:
                     rel_hints.append(f"- Join `{t1}` and `{t2}` ON `{t1}.{orig_k1} = {t2}.{orig_k2}`{date_note}")
 
         if rel_hints:
-            lines.append("Table Relationships & Join Hints:\n" + "\n".join(rel_hints) + "\n")
+            # Keep top 6 most relevant join hints to prevent prompt explosion on multi-table shops
+            compact_rel_hints = rel_hints[:6]
+            lines.append("Table Relationships & Join Hints:\n" + "\n".join(compact_rel_hints) + "\n")
 
         return "\n".join(lines)
 

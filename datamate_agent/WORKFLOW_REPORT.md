@@ -301,14 +301,26 @@ flowchart TD
   3. *Chuẩn hóa Snake_case ASCII hai chiều:* Khử dấu tiếng Việt qua Unicode NFKD, chuyển thành snake_case chuẩn, đánh chỉ mục chống trùng lặp (`cot`, `cot_2`), và lưu trữ từ điển ánh xạ `original_name -> clean_name` trong metadata để đưa vào Prompt cho LLM.
   4. *Vectorized Currency & Date Normalizer:* Nhận diện tự động các cột có $>70\%$ giá trị khớp mẫu số/tiền tệ Việt Nam để chuyển thành `DOUBLE` hoặc `BIGINT`. Chuẩn hóa các chuỗi ngày `DD/MM/YYYY`, `DD-MM-YYYY` và số serial Excel sang chuẩn ISO `YYYY-MM-DD`.
 
-### 8.3. Fix 3: Chống OOM vLLM, Prefix Caching & Sinh Song Song $n=8$ Mẫu (`llm_engine.py`)
-- **Vấn đề trước đây:** vLLM thường xuyên bị tràn bộ nhớ VRAM (CUDA OOM) trên Colab T4 (16GB) và L4 (24GB); mỗi câu hỏi phải tính toán lại toàn bộ ~14k token tiền tố; sinh tuần tự 8 mẫu khiến thời gian suy luận kéo dài gấp 8 lần.
+### 8.3. Fix 3: Chống OOM vLLM & HuggingFace Colab T4, Prefix Caching & Sinh Song Song $n=8$ Mẫu (`llm_engine.py`)
+- **Vấn đề trước đây:** 
+  1. vLLM bị tràn bộ nhớ VRAM (CUDA OOM) trên Colab T4 (16GB) và L4 (24GB) khi dùng mặc định 32k/128k context length.
+  2. Khi chạy chế độ Hugging Face fallback (BitsAndBytes 4-bit) trên Colab T4 (15.6GB VRAM), thiết lập cũ `PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"` ngăn PyTorch tái sử dụng các khối bộ nhớ $>128\text{MB}$, gây phân mảnh VRAM nghiêm trọng. Kèm theo prompt dài $>8\text{k}$ token khiến ma trận Attention và KV cache làm kiệt quệ GPU.
 - **Giải pháp triển khai:**
-  1. *Cấu hình An toàn VRAM:* Khởi tạo vLLM với `enable_prefix_caching=True`, `max_model_len=16384` (thay vì 32k/128k mặc định làm kiệt quệ bộ nhớ KV cache), `gpu_memory_utilization=0.90`.
-  2. *Tự động Phát hiện Phần cứng GPU:* Nếu VRAM $< 18\text{GB}$ (như GPU T4 16GB trên Colab Free), hệ thống tự động ép kiểu `dtype="half"` và nạp lượng tử hóa 4-bit (`awq` hoặc `bitsandbytes`).
-  3. *Hỗ trợ Nạp LoRA Động:* Kích hoạt `enable_lora=True`, `max_lora_rank=16`, truyền `LoRARequest` trực tiếp khi có checkpoint fine-tune.
-  4. *Batch Sampling $n=8$ Song song:* Triển khai hàm `generate_samples(prompts, n=8, ...)` gọi một lệnh duy nhất tới `SamplingParams(n=n, ...)` cho phép sinh đồng thời 8 bản nháp SQL chỉ trong 1 forward pass duy nhất.
-  5. *Dự phòng HuggingFace Transformers:* Tích hợp bộ nạp dự phòng `transformers` + `bitsandbytes` 4-bit cho môi trường kiểm thử không có vLLM.
+  1. *Cấu hình An toàn VRAM:*
+     - Thiết lập `os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"` kích hoạt quản lý bộ nhớ ảo (VMM) của PyTorch 2.0+, triệt tiêu hoàn toàn phân mảnh VRAM.
+     - Khởi tạo vLLM với `enable_prefix_caching=True`, `max_model_len=16384` (hoặc `8192` trên VRAM $<18\text{GB}$), `gpu_memory_utilization=0.90`.
+  2. *Tự động Phát hiện Phần cứng GPU (Hardware Auto-Detect):*
+     - Đo lường dung lượng VRAM thực tế bằng `torch.cuda.get_device_properties(0).total_memory`.
+     - Nếu VRAM $< 18\text{GB}$ (Colab T4 16GB): tự động nạp lượng tử hóa BitsAndBytes NF4 4-bit và giới hạn trần prompt context trong HuggingFace ở mức an toàn **3.584 tokens** (chỉ tốn ~4.5GB VRAM, chừa trống hơn 11GB VRAM).
+     - Nếu VRAM $\ge 18\text{GB}$ (Colab L4 24GB, A100): mở rộng trần prompt lên **7.168 - 16.384 tokens**.
+  3. *Cơ chế Cắt gọn Prompt Thông minh (Adaptive Windowing):*
+     - Khi prompt vượt quá ngưỡng an toàn, bộ chia tỉ lệ tự động giữ 55% đầu (System rules + bảng dữ liệu chính) và 45% cuối (Câu hỏi mục tiêu + Date anchors + Few-shots + Prefill `Notes:\n-`).
+  4. *Lá chắn OOM Dự phòng (OOM Exception Guard):*
+     - Bọc lệnh `generate()` trong khối `try ... except torch.cuda.OutOfMemoryError`. Nếu GPU gặp đột biến bộ nhớ bất ngờ, hệ thống lập tức dọn dẹp `gc.collect()` + `torch.cuda.empty_cache()` và trả về kết quả an toàn `TYPE: unanswerable` thay vì làm sập toàn bộ tiến trình thi.
+  5. *Hỗ trợ Nạp LoRA Động & Batch Sampling:*
+     - Hỗ trợ `enable_lora=True`, `max_lora_rank=16`.
+     - Trong vLLM: sinh đồng thời $n=8$ mẫu song song qua 1 lệnh `SamplingParams(n=n, ...)`.
+     - Trong HuggingFace: sinh tuần tự với `use_cache=True` và giải phóng cache định kỳ.
 
 ### 8.4. Fix 4: Phân tầng Prompt Tĩnh - Động Tuyệt đối cho KV Prefix Caching (`prompt_builder.py`)
 - **Vấn đề trước đây:** Việc đưa thông tin ngày mốc (`as_of_date`) hoặc câu hỏi cụ thể lên phần đầu User Prompt làm phá vỡ tính tương đồng của tiền tố (prefix), khiến vLLM không thể tái sử dụng KV cache giữa các câu hỏi của cùng một cửa hàng.

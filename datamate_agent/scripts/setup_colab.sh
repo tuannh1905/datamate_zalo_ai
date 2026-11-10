@@ -7,6 +7,7 @@ set -e
 
 echo "=== [1/4] Checking GPU Hardware ==="
 nvidia-smi
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 echo "=== [2/4] Installing Python Dependencies ==="
 pip install duckdb openpyxl pandas numpy pyyaml pydantic tqdm python-dateutil
