@@ -429,9 +429,10 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]
                     df[col] = orig_series
         else:
             # For non-date, non-amount columns that are completely empty / all NaN,
-            # cast to string/VARCHAR with None so DuckDB LOWER(col) won't throw Binder Error: lower(INTEGER/DOUBLE).
+            # cast to pandas StringDtype so DuckDB registers them strictly as VARCHAR.
+            # This prevents Binder Error: no function matches lower(INTEGER/DOUBLE).
             if df[col].isna().all():
-                df[col] = pd.Series([None] * len(df), dtype=object)
+                df[col] = pd.Series([None] * len(df), dtype="string")
 
     return df, col_mapping
 
@@ -531,10 +532,21 @@ def load_business_data(business_id: str, business_dir: str) -> BusinessContext:
                         pass
 
                 if sheet_dfs:
-                    first_cols = list(sheet_dfs[0][1].columns)
+                    first_cols = set(sheet_dfs[0][1].columns)
                     is_single_sheet = (len(sheet_dfs) == 1)
-                    is_homogenous = len(sheet_dfs) > 1 and all(
-                        list(s[1].columns) == first_cols for s in sheet_dfs
+                    
+                    # Check if sheets represent shards/monthly slices of the same table:
+                    # Either exact column match, high column overlap (>= 40%), or monthly sheet naming pattern
+                    is_monthly_pattern = all(
+                        bool(re.search(r"(?i)(?:thang|\bt\d{1,2}\b|\d{1,2}[._/]\d{4}|\b202\d\b|sheet\d+)", s[0]))
+                        for s in sheet_dfs
+                    )
+                    overlap_ratios = [
+                        len(first_cols & set(s[1].columns)) / max(len(first_cols), 1)
+                        for s in sheet_dfs
+                    ]
+                    is_homogenous = len(sheet_dfs) > 1 and (
+                        all(r >= 0.40 for r in overlap_ratios) or is_monthly_pattern
                     )
 
                     if is_single_sheet:

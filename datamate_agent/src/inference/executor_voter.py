@@ -390,9 +390,81 @@ class ExecutorVoter:
                 timer.daemon = True
                 timer.start()
 
-            rel = self.con.execute(cleaned_sql)
+            curr_sql = cleaned_sql
+            rel = None
+            err_last = None
+
+            # Deterministic self-healing retry loop (resolves table/column suggestions and function casts)
+            for attempt in range(3):
+                try:
+                    rel = self.con.execute(curr_sql)
+                    err_last = None
+                    break
+                except Exception as ex:
+                    err_last = str(ex)
+                    if timed_out[0]:
+                        break
+
+                    # Self-healing 1: DuckDB table suggestion (Did you mean "xyz"?)
+                    m_tbl = re.search(r'Table with name ([a-zA-Z0-9_]+) does not exist!\s*Did you mean "([^"]+)"\?', err_last)
+                    if m_tbl:
+                        w_tbl, r_tbl = m_tbl.group(1), m_tbl.group(2)
+                        curr_sql = re.sub(r'\b' + re.escape(w_tbl) + r'\b', r_tbl, curr_sql, flags=re.IGNORECASE)
+                        continue
+
+                    # Self-healing 2: DuckDB column suggestion (Did you mean "xyz"?)
+                    m_col = re.search(r'(?:Column with name|Referenced column) "([a-zA-Z0-9_]+)" not found.*Did you mean "([^"]+)"\?', err_last)
+                    if m_col:
+                        w_col, r_col = m_col.group(1), m_col.group(2)
+                        curr_sql = re.sub(r'\b' + re.escape(w_col) + r'\b', r_col, curr_sql, flags=re.IGNORECASE)
+                        continue
+
+                    # Self-healing 3: LOWER() on non-VARCHAR type (Binder Error: lower(INTEGER/DOUBLE))
+                    if "no function matches the given name and argument types 'lower(" in err_last.lower():
+                        new_sql = re.sub(r'(?i)\blower\s*\(\s*([^()]+?)\s*\)', r'LOWER(CAST(\1 AS VARCHAR))', curr_sql)
+                        if new_sql != curr_sql:
+                            curr_sql = new_sql
+                            continue
+
+                    # Self-healing 4: Fuzzy table match when table missing but similar table exists
+                    m_tbl_no_sugg = re.search(r'Table with name ([a-zA-Z0-9_]+) does not exist!', err_last)
+                    if m_tbl_no_sugg:
+                        w_tbl = m_tbl_no_sugg.group(1)
+                        try:
+                            all_tables = [t[0] for t in self.con.execute("SHOW TABLES").fetchall()]
+                            # Find best matching table by key parts
+                            w_norm = normalize_identifier(w_tbl)
+                            candidates = [t for t in all_tables if w_norm in t or t in w_norm]
+                            if candidates:
+                                best_tbl = max(candidates, key=lambda t: len(set(w_norm.split('_')) & set(t.split('_'))))
+                                curr_sql = re.sub(r'\b' + re.escape(w_tbl) + r'\b', best_tbl, curr_sql, flags=re.IGNORECASE)
+                                continue
+                        except Exception:
+                            pass
+
+                    break
+
+            if err_last is not None:
+                if timed_out[0]:
+                    return False, None, f"SQL query timed out after {self.timeout}s (interrupted)", []
+                return False, None, err_last, []
+
             col_names = [desc[0] for desc in rel.description] if rel.description else []
             rows = rel.fetchall()
+
+            # Self-healing 5: If status equality '=' returned empty result or [(0,)], try ILIKE
+            # In Vietnamese retail systems, status often has prefix 'Đã ' ('Đã hoàn thành', 'Đã hủy').
+            if (not rows or rows == [(0,)] or rows == [(None,)]) and re.search(r"(?i)\b(?:trang_thai|status|tinh_trang)\s*=\s*'([^']*)'", curr_sql):
+                alt_sql = re.sub(r"(?i)\b(trang_thai|status|tinh_trang)\s*=\s*'([^']*)'", r"\1 ILIKE '%\2%'", curr_sql)
+                if alt_sql != curr_sql:
+                    try:
+                        alt_rel = self.con.execute(alt_sql)
+                        alt_rows = alt_rel.fetchall()
+                        if alt_rows and alt_rows != [(0,)] and alt_rows != [(None,)]:
+                            return True, alt_rows, None, col_names
+                    except Exception:
+                        pass
+
             return True, rows, None, col_names
         except Exception as e:
             if timed_out[0]:
@@ -418,6 +490,23 @@ class ExecutorVoter:
         m_sugg = re.search(r'Did you mean "([^"]+)"\?', error_msg)
         if m_sugg:
             hint = f"\nHint from DuckDB: Did you mean table '{m_sugg.group(1)}'?"
+
+        # Check if DuckDB said a column is not found in FROM clause
+        m_col = re.search(r'Referenced column "([^"]+)" not found in FROM clause!', error_msg)
+        if m_col and self.con:
+            missing_col = m_col.group(1)
+            matching_tables = []
+            try:
+                all_tbls = [t[0] for t in self.con.execute("SHOW TABLES").fetchall()]
+                for t in all_tbls:
+                    if t.startswith("raw_") and not t.endswith("_df"):
+                        c_names = [c[0].lower() for c in self.con.execute(f'DESCRIBE "{t}"').fetchall()]
+                        if missing_col.lower() in c_names:
+                            matching_tables.append(t)
+            except Exception:
+                pass
+            if matching_tables:
+                hint += f"\nHint: Column '{missing_col}' is present in table(s): {matching_tables}. You must query or JOIN with one of these tables."
 
         messages = [
             {

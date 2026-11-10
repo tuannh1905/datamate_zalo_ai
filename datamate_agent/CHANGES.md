@@ -360,3 +360,14 @@ Toàn bộ test suite chạy thành công 100%:
 | `q_006c26c65d50` | `biz_112` | thang 7/2026 co bao nhiu don co dthu tu 55.000 dong tro len (as_of: 2026-07-31) | 1059 (Sai logic line-item) | **2,345** | `2345` | Nhận diện đúng cấu trúc chi tiết, gom nhóm `GROUP BY ma_don_hang HAVING SUM >= 55000` |
 
 - **Điểm Penalized Accuracy (PA):** Tăng từ **-0.2000** lên **+1.0000** (5/5 câu chính xác tuyệt đối khi câu truy vấn SQL được tạo đúng theo schema chuẩn).
+
+### 5.5. Cải Tiến Bổ Sung Sau Kiểm Thử Thực Tế trên GPU Colab
+1. **Hợp nhất phân mảnh Sheet theo tháng (Excel Multi-sheet Shard Concatenation)**:
+   - Các bảng chia theo tháng (`01.2026`, `02.2026` hoặc `T06_2026`, `T07_2026`) được tự động gom nhóm bằng `pd.concat` vào bảng chính `raw_{table}` thay vì tạo 20+ bảng nhỏ gây tràn context schema summary và làm thiếu tháng dữ liệu (như tháng 7/2026 của `biz_112`).
+2. **Cơ chế Tự Sửa Lỗi Xác định (Deterministic Self-Healing in `execute_single_sql`)**:
+   - Tự động thay thế tên bảng từ gợi ý DuckDB (`Did you mean "danhsachhoadonchitiet"?`) mà không cần tốn lượt gọi LLM.
+   - Tự động bọc `LOWER(CAST(col AS VARCHAR))` khi gặp lỗi Binder `lower(INTEGER/DOUBLE)`.
+   - Tự động chuyển đổi `trang_thai = 'Hoàn thành'` thành `trang_thai ILIKE '%Hoàn thành%'` khi kết quả trả về 0 dòng do dữ liệu thực tế có tiền tố `'Đã hoàn thành'`.
+3. **Gợi ý bảng chứa cột cho Tier-2 Repair**:
+   - Khi DuckDB báo lỗi `Referenced column "xyz" not found in FROM clause`, hệ thống tự động quét catalog và bổ sung hint vào prompt sửa lỗi: `Hint: Column 'xyz' is present in table(s): [...]`.
+4. **Kiểm thử**: Đạt 73/73 tests pass trên `pytest tests -q`.

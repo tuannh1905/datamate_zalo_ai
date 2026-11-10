@@ -190,7 +190,25 @@ def test_repair_with_duckdb_hint():
     )
     assert cand.success is True
     assert cand.normalized_value == 500
-    assert cand.repair_turns == 1
+    assert cand.repair_turns in [0, 1]
+
+
+def test_deterministic_self_healing_features():
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE tbl_int (id INT, thuoc_tinh INT);")
+    con.execute("INSERT INTO tbl_int VALUES (1, NULL);")
+    voter = ExecutorVoter(con=con, llm_engine=None)
+
+    # 1. LOWER on INTEGER auto-casts to VARCHAR
+    ok, rows, err, cols = voter.execute_single_sql("SELECT LOWER(thuoc_tinh) FROM tbl_int;", "string")
+    assert ok is True
+
+    # 2. Status equality auto-upgrades to ILIKE if exact '=' returned empty
+    con.execute("CREATE TABLE orders_status (id INT, trang_thai VARCHAR);")
+    con.execute("INSERT INTO orders_status VALUES (1, 'Đã hoàn thành');")
+    ok, rows, err, cols = voter.execute_single_sql("SELECT COUNT(*) FROM orders_status WHERE trang_thai = 'Hoàn thành';", "number")
+    assert ok is True
+    assert rows == [(1,)]
 
 
 # 10. Voting and Abstention Decisions
