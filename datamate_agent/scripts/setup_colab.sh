@@ -10,7 +10,7 @@ nvidia-smi
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 echo "=== [2/4] Installing Python Dependencies ==="
-pip install duckdb openpyxl pandas numpy pyyaml pydantic tqdm python-dateutil
+pip install duckdb openpyxl pandas numpy pyyaml pydantic tqdm python-dateutil python-calamine
 pip install "huggingface-hub>=1.5.0,<2.0"
 pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git" || echo "Notice: Unsloth install failed, falling back to standard PEFT."
 pip install peft accelerate bitsandbytes datasets
@@ -41,6 +41,11 @@ python3 -c "
 import duckdb, torch, openpyxl
 print('✓ DuckDB Version:', duckdb.__version__)
 print('✓ CUDA Available:', torch.cuda.is_available(), 'Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None')
+try:
+    import calamine
+    print('✓ Calamine Version (Fast Excel):', getattr(calamine, '__version__', 'Installed'))
+except ImportError:
+    print('Notice: python-calamine not found, openpyxl will be used.')
 try:
     import vllm
     print('✓ vLLM Version:', vllm.__version__)
