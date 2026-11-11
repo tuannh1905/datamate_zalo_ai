@@ -5,11 +5,30 @@ from .debt_macros import register_debt_macros, DebtMacroStatus
 from .dataset_loader import load_dataset, DatasetPaths, is_already_cached
 from .dataset_registry import resolve_dataset, list_datasets, load_registry
 
+from .profiler import (
+    prepare,
+    build_profile,
+    render_schema,
+    diagnose_empty_result,
+    install_macros,
+    union_homogeneous,
+    normalize_types,
+    ProfileResult,
+)
+
 __all__ = [
     "BusinessContext",
     "load_business_data",
     "normalize_identifier",
     "resolve_business_dir",
+    "prepare",
+    "build_profile",
+    "render_schema",
+    "diagnose_empty_result",
+    "install_macros",
+    "union_homogeneous",
+    "normalize_types",
+    "ProfileResult",
     "build_canonical_views",
     "ViewBuildResult",
     "register_debt_macros",

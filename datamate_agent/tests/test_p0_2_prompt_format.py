@@ -8,7 +8,7 @@ def test_qa_template_no_duplicate_assistant():
         content = f.read()
     # Ensure template does not end with Assistant:\nNotes:\n-
     assert "Assistant:\nNotes:" not in content
-    assert content.strip().endswith("Please write your reasoning in Notes, then output the target TYPE and the DuckDB SQL query.")
+    assert content.strip().endswith("Output ONLY the target TYPE followed by the ```sql ... ``` query block.")
 
 
 def test_build_chat_prompt_chatml():
@@ -16,23 +16,23 @@ def test_build_chat_prompt_chatml():
         {"role": "system", "content": "You are a database assistant."},
         {"role": "user", "content": "Calculate total revenue."},
     ]
-    prompt = build_chat_prompt(tokenizer=None, messages=messages, prefill="Notes:\n-")
+    prompt = build_chat_prompt(tokenizer=None, messages=messages, prefill="TYPE: ")
     
     # Verify structure
     assert "<|im_start|>system\nYou are a database assistant.<|im_end|>" in prompt
     assert "<|im_start|>user\nCalculate total revenue.<|im_end|>" in prompt
-    assert prompt.endswith("<|im_start|>assistant\nNotes:\n-")
+    assert prompt.endswith("<|im_start|>assistant\nTYPE: ")
     
-    # Count occurrences of "assistant" / "Notes:" to ensure no duplication
+    # Count occurrences of "assistant" / "TYPE: " to ensure no duplication
     assert prompt.count("<|im_start|>assistant") == 1
-    assert prompt.count("Notes:\n-") == 1
+    assert prompt.count("TYPE: ") == 1
 
 
 def test_sft_sample_alignment():
     # Simulate SFT entry assembly
     system_content = "You are a database assistant."
     user_content = "Calculate total revenue."
-    assistant_completion = "Notes:\n- We sum amounts.\nTYPE: number\n```sql\nSELECT 1;\n```"
+    assistant_completion = "TYPE: number\n```sql\nSELECT 1;\n```"
 
     sft_messages = [
         {"role": "system", "content": system_content},
@@ -48,6 +48,6 @@ def test_sft_sample_alignment():
 
     response_part = "<|im_start|>assistant\n"
     assert response_part in full_sft_text
-    # The text following response_part should start with Notes:\n-
+    # The text following response_part should start with TYPE:
     after_resp = full_sft_text.split(response_part)[1]
-    assert after_resp.startswith("Notes:\n-")
+    assert after_resp.startswith("TYPE: ")

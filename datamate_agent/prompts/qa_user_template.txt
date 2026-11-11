@@ -5,38 +5,35 @@ Business ID: {business_id}
 {business_readme}
 
 ===================================================================
-2. DATABASE SCHEMA & SAMPLE DATA
+2. DATABASE SCHEMA (PROFILED & UNIFIED TABLES)
 ===================================================================
-The DuckDB database contains the following tables:
-{schema_and_samples}
+{schema_summary}
 
 ===================================================================
-3. CANONICAL VIEWS & MACROS (IF CONSTRUCTED)
-===================================================================
-{canonical_views_section}
-
-===================================================================
-4. DATE ANCHORS & TIME WINDOW RESOLUTION
+3. DATE ANCHORS & TIME WINDOW RESOLUTION
 ===================================================================
 - Today (as_of_date): {as_of_date}
 - Target Date Context:
 {date_anchors_explanation}
 
 ===================================================================
-5. RULEBOOK CONSTRAINTS & HINTS
+4. RULEBOOK CONSTRAINTS & HINTS
 ===================================================================
 - The Business Rulebook provided in the system prompt is the authoritative single source of truth for all metric calculations, status filtering, date definitions, ranking ties, and rounding conventions.
+- Use the exact table and column names shown in SCHEMA. Notice that monthly shard tables have already been merged into a single table!
+- All DATE, BIGINT, and DOUBLE columns are already properly typed—use SUM(), AVG(), and col BETWEEN DATE 'YYYY-MM-DD' AND DATE 'YYYY-MM-DD' directly.
+- For categorical columns with ∈ [val1 (count), val2 (count)], copy the exact string literal from the enum list, OR use the accent-insensitive macro vn(col) = vn('gia tri') / vn(col) LIKE '%' || vn('tu khoa') || '%'.
+- Use only verified joins listed under QUAN HE JOIN DA KIEM CHUNG.
 - If the required columns or tables do not exist in the database to answer the question, output TYPE: unanswerable.
 - Ensure all queries are valid DuckDB SQL syntax.
-- When canonical views (`v_sales`, `v_orders`) are available, you may query them; otherwise query raw tables directly.
 
 ===================================================================
-6. FEW-SHOT EXAMPLES (SIMILAR QUESTIONS)
+5. FEW-SHOT EXAMPLES (SIMILAR QUESTIONS)
 ===================================================================
 {few_shot_examples}
 
 ===================================================================
-7. CURRENT QUESTION & HINTS
+6. CURRENT QUESTION & HINTS
 ===================================================================
 Question: "{question}"
 As-of Date: {as_of_date}
@@ -51,4 +48,4 @@ Vietnamese abbreviations hint:
 - 'sl' = quantity
 - 'km', 'ck' = discount / promotion
 
-Please write your reasoning in Notes, then output the target TYPE and the DuckDB SQL query.
+Output ONLY the target TYPE followed by the ```sql ... ``` query block.

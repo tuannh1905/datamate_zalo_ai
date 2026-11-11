@@ -147,12 +147,15 @@ class LLMEngine:
                 self.llm = None
                 self.is_offline_vllm = False
 
-        # 2. If vLLM is not active but CUDA is available, use HuggingFace Transformers + bitsandbytes 4-bit
+        # 2. If vLLM is not active but CUDA is available, use HuggingFace Transformers
         if not self.is_offline_vllm and HAS_CUDA and (os.path.exists(model_name_or_path) or "/" in model_name_or_path):
             try:
                 from transformers import AutoModelForCausalLM, AutoTokenizer
                 logger.info(f"Loading Hugging Face model on GPU: {model_name_or_path}")
                 self.hf_tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+                self.hf_tokenizer.padding_side = "left"
+                if self.hf_tokenizer.pad_token_id is None:
+                    self.hf_tokenizer.pad_token_id = self.hf_tokenizer.eos_token_id
 
                 is_ampere_or_later = False
                 if torch.cuda.is_available():
@@ -165,37 +168,30 @@ class LLMEngine:
 
                 loaded_successfully = False
                 quant_used = "None"
-                # Try 4-bit quantization (BitsAndBytes)
-                try:
-                    from transformers import BitsAndBytesConfig
-                    bnb_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_compute_dtype=compute_dtype,
-                        bnb_4bit_use_double_quant=True,
-                    )
-                    self.hf_model = AutoModelForCausalLM.from_pretrained(
-                        model_name_or_path,
-                        quantization_config=bnb_config,
-                        device_map="auto",
-                        trust_remote_code=trust_remote_code,
-                    )
-                    loaded_successfully = True
-                    quant_used = "BitsAndBytes NF4 (4-bit)"
-                    logger.info("Successfully loaded model with BitsAndBytes 4-bit (NF4) quantization.")
-                except Exception as bnb_err:
-                    logger.warning(f"BitsAndBytes 4-bit load failed or unavailable ({bnb_err}). Trying load_in_4bit=True...")
+                want_4bit = (quantization or "").lower() in ("4bit", "bitsandbytes")
+                want_native = (quantization or "").lower() in ("none", "fp16", "half") or (quantization is None and "3b" in model_name_or_path.lower())
+
+                if not want_native and (want_4bit or (self.is_low_vram and "7b" in model_name_or_path.lower())):
+                    # Try 4-bit quantization (BitsAndBytes)
                     try:
+                        from transformers import BitsAndBytesConfig
+                        bnb_config = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_quant_type="nf4",
+                            bnb_4bit_compute_dtype=compute_dtype,
+                            bnb_4bit_use_double_quant=True,
+                        )
                         self.hf_model = AutoModelForCausalLM.from_pretrained(
                             model_name_or_path,
-                            load_in_4bit=True,
+                            quantization_config=bnb_config,
                             device_map="auto",
                             trust_remote_code=trust_remote_code,
                         )
                         loaded_successfully = True
-                        quant_used = "load_in_4bit=True"
-                    except Exception as bnb_err2:
-                        logger.warning(f"4-bit load failed ({bnb_err2}). Falling back to native precision...")
+                        quant_used = "BitsAndBytes NF4 (4-bit)"
+                        logger.info("Successfully loaded model with BitsAndBytes 4-bit (NF4) quantization.")
+                    except Exception as bnb_err:
+                        logger.warning(f"BitsAndBytes 4-bit load failed or unavailable ({bnb_err}). Falling back to native precision...")
 
                 if not loaded_successfully:
                     self.hf_model = AutoModelForCausalLM.from_pretrained(
@@ -245,25 +241,22 @@ class LLMEngine:
     def _prepare_inputs(self, prompt: str, max_tokens: Optional[int] = None) -> Tuple[Dict[str, Any], int]:
         """
         Tokenizes on CPU and safely windows the prompt to avoid quadratic attention OOM on 16GB GPUs.
-        Prioritizes the User Prompt (Database Schema, Tables, and Question) at the tail.
+        If prompt length exceeds target_max, preserves the tail tokens so Database Schema & Question
+        are NEVER dropped from the context.
         """
-        target_max = max_tokens or getattr(self, "hf_max_prompt_tokens", 3584)
+        target_max = max_tokens or getattr(self, "hf_max_prompt_tokens", 4096)
         inputs = self.hf_tokenizer(prompt, return_tensors="pt")
         total_tokens = inputs["input_ids"].shape[1]
         if total_tokens > target_max:
-            # User prompt (containing Database Schema and Question) is at the tail of the prompt.
-            # Preserve 80% of budget for User Prompt (Schema + Question) and 20% for Core System Rules.
-            keep_sys = min(int(target_max * 0.20), 700)
-            keep_user = target_max - keep_sys
             logger.info(
                 f"[VRAM Guard] Prompt length ({total_tokens} tokens) exceeds safe threshold ({target_max} tokens). "
-                f"Windowing on CPU: keeping first {keep_sys} tokens + last {keep_user} tokens (schema & question preserved)."
+                f"Preserving tail {target_max} tokens (Database Schema & Question kept intact)."
             )
-            input_ids = torch.cat([inputs["input_ids"][:, :keep_sys], inputs["input_ids"][:, -keep_user:]], dim=1)
-            attention_mask = torch.cat([inputs["attention_mask"][:, :keep_sys], inputs["attention_mask"][:, -keep_user:]], dim=1)
+            input_ids = inputs["input_ids"][:, -target_max:]
+            attention_mask = inputs["attention_mask"][:, -target_max:]
             del inputs
             inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
-            total_tokens = input_ids.shape[1]
+            total_tokens = target_max
 
         gpu_inputs = {k: v.to(self.hf_model.device) for k, v in inputs.items()}
         del inputs
@@ -307,12 +300,9 @@ class LLMEngine:
 
         # 2. HuggingFace fallback
         if self.is_hf_gpu and self.hf_model is not None and self.hf_tokenizer is not None:
-            gc.collect()
-            if HAS_CUDA and torch is not None:
-                torch.cuda.empty_cache()
             all_results = []
             do_sample = temperature > 0.0
-            max_seq = getattr(self, "hf_max_prompt_tokens", 3584)
+            max_seq = getattr(self, "hf_max_prompt_tokens", 4096)
 
             # Stopping criteria to halt generation immediately when SQL block finishes
             stopping_criteria_cls = None
@@ -328,10 +318,10 @@ class LLMEngine:
 
                     def __call__(self, input_ids: Any, scores: Any, **kwargs) -> bool:
                         new_ids = input_ids[0, self.prompt_length:]
-                        if len(new_ids) < 20:
+                        if len(new_ids) < 15:
                             return False
                         tail = self.tokenizer.decode(new_ids[-6:], skip_special_tokens=False)
-                        return any(p in tail for p in self.stop_patterns)
+                        return any(p in tail for p in self.stop_patterns) or "<|im_end|>" in tail
 
                 stopping_criteria_cls = SQLBlockClosingCriteria
             except Exception:
@@ -344,7 +334,7 @@ class LLMEngine:
                     gen_kwargs: Dict[str, Any] = {
                         "max_new_tokens": max_tokens,
                         "do_sample": do_sample,
-                        "pad_token_id": self.hf_tokenizer.eos_token_id,
+                        "pad_token_id": self.hf_tokenizer.pad_token_id or self.hf_tokenizer.eos_token_id,
                         "use_cache": True,
                     }
                     if do_sample:
@@ -358,7 +348,7 @@ class LLMEngine:
                             ])
                         except Exception:
                             pass
-                    
+
                     try:
                         with torch.inference_mode():
                             gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
@@ -374,8 +364,6 @@ class LLMEngine:
                         if HAS_CUDA and torch is not None:
                             torch.cuda.empty_cache()
                         fallback_completion = (
-                            "Notes:\n"
-                            "- [CUDA OOM Guard]: Memory limit reached.\n"
                             "TYPE: unanswerable\n"
                             "```sql\n"
                             "SELECT NULL AS answer;\n"
@@ -383,24 +371,16 @@ class LLMEngine:
                         )
                         prompt_samples.append(fallback_completion)
 
-                    if HAS_CUDA and torch is not None:
-                        torch.cuda.empty_cache()
-
                 del inputs
-                gc.collect()
-                if HAS_CUDA and torch is not None:
-                    torch.cuda.empty_cache()
                 all_results.append(prompt_samples)
 
             return all_results
 
         # 3. CPU / Fallback Mock Mode
         mock_resp = (
-            "Notes:\n"
-            "- Calculation for total amount.\n"
-            "TYPE: number\n"
+            "number\n"
             "```sql\n"
-            "SELECT COALESCE(ROUND(SUM(line_amount), 0), 0) AS answer FROM v_sales WHERE is_valid_sales = TRUE;\n"
+            "SELECT 42 AS answer;\n"
             "```"
         )
         return [[mock_resp] * n for _ in prompt_list]

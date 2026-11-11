@@ -19,9 +19,7 @@ from tqdm import tqdm
 
 from ..context.prompt_builder import PromptBuilder, build_chat_prompt
 from ..data_layer.dataset_loader import group_questions_by_business, load_questions
-from ..data_layer.debt_macros import register_debt_macros
 from ..data_layer.ingest import BusinessContext, load_business_data, resolve_business_dir
-from ..data_layer.view_builder import build_canonical_views
 from ..inference.executor_voter import CandidateExecution, ExecutorVoter
 from ..inference.llm_engine import LLMEngine
 
@@ -78,21 +76,13 @@ def generate_training_candidates(
             continue
 
         ctx = load_business_data(b_id, b_dir)
-        view_res = build_canonical_views(ctx, k=8)
-        debt_status = register_debt_macros(ctx, plausibility_check=True)
-
-        shop_prefix = prompt_builder.build_shop_static_prefix(
-            ctx=ctx,
-            canonical_sales_sql=view_res.v_sales_sql if view_res.success else None,
-            canonical_orders_sql=view_res.v_orders_sql if view_res.success else None,
-            canonical_purchases_sql=view_res.v_purchases_sql if view_res.success else None,
-            has_debt_macros=debt_status.registered,
-        )
+        shop_prefix = prompt_builder.build_shop_static_prefix(ctx=ctx)
 
         voter = ExecutorVoter(
             con=ctx.con,
             llm_engine=llm_engine,
             schema_summary=ctx.get_schema_summary(),
+            ctx=ctx,
         )
 
         for q in q_list:
@@ -110,7 +100,7 @@ def generate_training_candidates(
             full_prompt = build_chat_prompt(
                 tokenizer=llm_engine.tokenizer,
                 messages=messages,
-                prefill="Notes:\n-",
+                prefill="TYPE: ",
             )
 
             # 1. Generate plain samples in single batch forward pass
@@ -133,7 +123,7 @@ def generate_training_candidates(
             thinking_prompt = build_chat_prompt(
                 tokenizer=llm_engine.tokenizer,
                 messages=thinking_messages,
-                prefill="Notes:\n-",
+                prefill="TYPE: ",
             )
             thinking_completions = llm_engine.generate_samples(
                 prompts=[thinking_prompt],
@@ -145,7 +135,7 @@ def generate_training_candidates(
             sample_records = []
 
             for idx, comp in enumerate(plain_completions):
-                full_text = comp if comp.startswith("Notes:\n-") else ("Notes:\n-" + comp)
+                full_text = comp if comp.strip().startswith("TYPE:") else ("TYPE: " + comp.strip())
                 cand = voter.process_candidate(
                     sample_id=idx,
                     raw_completion=full_text,
@@ -166,7 +156,7 @@ def generate_training_candidates(
                 })
 
             for idx, comp in enumerate(thinking_completions):
-                full_text = comp if comp.startswith("Notes:\n-") else ("Notes:\n-" + comp)
+                full_text = comp if comp.strip().startswith("TYPE:") else ("TYPE: " + comp.strip())
                 cand = voter.process_candidate(
                     sample_id=num_plain_samples + idx,
                     raw_completion=full_text,

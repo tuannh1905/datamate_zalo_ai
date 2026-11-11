@@ -98,6 +98,14 @@ def parse_completion(text: str) -> Tuple[Optional[str], Optional[str]]:
                 break
 
     if not pred_type:
+        m_start = re.match(r"^\s*([a-zA-Z_]+)", text)
+        if m_start:
+            raw_t = m_start.group(1).lower().strip()
+            if raw_t in valid_types:
+                pred_type = raw_t
+                type_pos = m_start.end()
+
+    if not pred_type:
         return None, None
 
     if pred_type == "unanswerable":
@@ -255,6 +263,7 @@ class ExecutorVoter:
         sql_timeout_seconds: float = 5.0,  # Strict 5.0-second timeout
         max_repair_turns: int = 2,
         schema_summary: Optional[str] = None,
+        ctx: Optional[Any] = None,
     ):
         self.con = con
         self.llm_engine = llm_engine
@@ -262,6 +271,7 @@ class ExecutorVoter:
         self.timeout = sql_timeout_seconds
         self.max_repairs = max_repair_turns
         self.schema_summary = schema_summary
+        self.ctx = ctx
 
     def _execute_query_internal(self, sql: str) -> Tuple[bool, Any, Optional[str], List[str]]:
         """
@@ -364,19 +374,30 @@ class ExecutorVoter:
 
     def repair_sql_turn(self, bad_sql: str, error_msg: str, orig_question: str) -> Optional[str]:
         """
-        Requests the LLM to fix a failed SQL statement given DuckDB error message
-        and database table column names.
+        Requests the LLM to fix a failed SQL statement given DuckDB error message,
+        content-driven diagnostic hints, and question-specific database schema.
         """
         if not self.llm_engine:
             return None
 
         from ..context.prompt_builder import build_chat_prompt
-        compact_schema = self.schema_summary or ""
+
+        compact_schema = ""
+        diag_hints = []
+        if self.ctx and getattr(self.ctx, "profile", None) is not None:
+            from ..data_layer.profiler import render_schema, diagnose_empty_result
+            compact_schema = render_schema(self.ctx.profile, orig_question, max_chars=4500)
+            diag_hints = diagnose_empty_result(self.ctx, self.ctx.profile, bad_sql)
+        else:
+            compact_schema = self.schema_summary or ""
 
         hint = ""
+        if diag_hints:
+            hint = "\n" + "\n".join([f"- {h}" for h in diag_hints])
+
         m_sugg = re.search(r'Did you mean "([^"]+)"\?', error_msg)
         if m_sugg:
-            hint = f"\nHint from DuckDB: Did you mean table/column '{m_sugg.group(1)}'?"
+            hint += f"\nHint from DuckDB: Did you mean table/column '{m_sugg.group(1)}'?"
 
         m_col = re.search(r'Referenced column "([^"]+)" not found in FROM clause!', error_msg)
         if m_col and self.con:
@@ -385,7 +406,7 @@ class ExecutorVoter:
             try:
                 all_tbls = [t[0] for t in self.con.execute("SHOW TABLES").fetchall()]
                 for t in all_tbls:
-                    if t.startswith("raw_") and not t.endswith("_df"):
+                    if not t.endswith("_df"):
                         c_names = [c[0].lower() for c in self.con.execute(f'DESCRIBE "{t}"').fetchall()]
                         if missing_col.lower() in c_names:
                             matching_tables.append(t)
@@ -394,31 +415,34 @@ class ExecutorVoter:
             if matching_tables:
                 hint += f"\nHint: Column '{missing_col}' is present in table(s): {matching_tables}. You must query or JOIN with one of these tables."
 
+        err_desc = error_msg if error_msg else "Query returned empty/NULL result."
+
         messages = [
             {
                 "role": "system",
                 "content": (
                     "You are an expert DuckDB SQL repair assistant.\n"
                     "Fix the erroneous SQL query so that it executes without errors and answers the question.\n"
-                    "Output ONLY the corrected SQL query within a ```sql ... ``` code block."
+                    "Output ONLY the target TYPE followed by the corrected DuckDB SQL query within a ```sql ... ``` code block."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"The following DuckDB SQL query produced an error:\n"
+                    f"The following DuckDB SQL query produced an error or empty result:\n"
                     f"```sql\n{bad_sql}\n```\n\n"
-                    f"DuckDB Error:\n{error_msg}{hint}\n\n"
+                    f"Issue / Error:\n{err_desc}{hint}\n\n"
                     f"Question:\n{orig_question}\n\n"
                     + (f"Database Tables & Columns:\n{compact_schema}\n\n" if compact_schema else "")
-                    + "Please fix the SQL query to resolve the error and answer the question. Output ONLY ```sql ... ```."
+                    + "Please fix the SQL query to resolve the error and answer the question.\n"
+                    "Output format:\nTYPE: <type>\n```sql\nSELECT ...\n```"
                 ),
             },
         ]
         repair_prompt = build_chat_prompt(
             tokenizer=self.llm_engine.tokenizer,
             messages=messages,
-            prefill="```sql\n",
+            prefill="TYPE: ",
         )
         try:
             completions = self.llm_engine.generate_single(
@@ -429,8 +453,8 @@ class ExecutorVoter:
             )
             if completions:
                 raw_out = completions[0].strip()
-                if not raw_out.startswith("```"):
-                    raw_out = f"```sql\n{raw_out}\n```"
+                if not raw_out.startswith("TYPE:") and not raw_out.startswith("```"):
+                    raw_out = f"TYPE: {raw_out}"
                 _, rep_sql = parse_completion(raw_out)
                 if not rep_sql:
                     m = re.search(r"(?is)\b(WITH|SELECT)\b[\s\S]+", raw_out)

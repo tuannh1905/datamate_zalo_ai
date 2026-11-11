@@ -21,13 +21,13 @@ logger = logging.getLogger(__name__)
 def build_chat_prompt(
     tokenizer: Optional[Any],
     messages: List[Dict[str, str]],
-    prefill: str = "Notes:\n-",
+    prefill: str = "TYPE: ",
 ) -> str:
     """
     Standardized chat prompt builder across train, inference, and repair.
     Applies tokenizer.apply_chat_template(messages, add_generation_prompt=True) + prefill.
     Falls back to ChatML format if tokenizer is unavailable.
-    Always ends raw prompt string with prefill ("Notes:\n-").
+    Always ends raw prompt string with prefill ("TYPE: ").
     """
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         try:
@@ -57,16 +57,12 @@ FEW_SHOT_EX1 = """
 Example 1 (Doanh thu tháng này - number):
 Question: "doanh thu tháng này của quán là bao nhiêu?"
 Date Anchors: Tháng này: từ 2026-08-01 đến 2026-08-20.
-Notes:
-- [Entity & Time analysis]: Target is total sales revenue for 'tháng này' (2026-08-01 to 2026-08-20).
-- [Logic & Formulas]: Sum line amounts excluding cancelled/returned orders. Round to integer VND.
-- [Output Type]: number
 TYPE: number
 ```sql
 SELECT ROUND(SUM(thanh_tien), 0) AS answer
-FROM don_hang_chi_tiet
-WHERE TRY_CAST(ngay AS DATE) BETWEEN '2026-08-01' AND '2026-08-20'
-  AND LOWER(trang_thai) NOT IN ('huỷ', 'trả hàng');
+FROM ban_hang
+WHERE ngay_ban BETWEEN DATE '2026-08-01' AND DATE '2026-08-20'
+  AND vn(trang_thai) NOT IN ('huy', 'tra hang');
 ```
 """.strip()
 
@@ -74,23 +70,19 @@ FEW_SHOT_EX2 = """
 Example 2 (Tỉ lệ tăng trưởng doanh thu so với kỳ trước - percent):
 Question: "doanh thu tuần này tăng hay giảm bao nhiêu % so với tuần trước?"
 Date Anchors: Tuần này: 2026-05-11 đến 2026-05-15. Tuần trước: 2026-05-04 đến 2026-05-10.
-Notes:
-- [Entity & Time analysis]: Compare revenue of this week vs last week.
-- [Logic & Formulas]: Growth formula: ((Rev_this - Rev_last) / Rev_last) * 100. Round to 2 decimals.
-- [Output Type]: percent
 TYPE: percent
 ```sql
 WITH rev_this AS (
     SELECT COALESCE(SUM(thanh_tien), 0) AS val
-    FROM don_hang_chi_tiet
-    WHERE TRY_CAST(ngay AS DATE) BETWEEN '2026-05-11' AND '2026-05-15'
-      AND LOWER(trang_thai) NOT IN ('huỷ', 'trả hàng')
+    FROM ban_hang
+    WHERE ngay_ban BETWEEN DATE '2026-05-11' AND DATE '2026-05-15'
+      AND vn(trang_thai) NOT IN ('huy', 'tra hang')
 ),
 rev_last AS (
     SELECT COALESCE(SUM(thanh_tien), 0) AS val
-    FROM don_hang_chi_tiet
-    WHERE TRY_CAST(ngay AS DATE) BETWEEN '2026-05-04' AND '2026-05-10'
-      AND LOWER(trang_thai) NOT IN ('huỷ', 'trả hàng')
+    FROM ban_hang
+    WHERE ngay_ban BETWEEN DATE '2026-05-04' AND DATE '2026-05-10'
+      AND vn(trang_thai) NOT IN ('huy', 'tra hang')
 )
 SELECT ROUND(((rev_this.val - rev_last.val) / NULLIF(rev_last.val, 0)) * 100.0, 2) AS answer
 FROM rev_this, rev_last;
@@ -101,16 +93,12 @@ FEW_SHOT_EX3 = """
 Example 3 (Top 3 mặt hàng bán chạy nhất - list):
 Question: "top 3 món bán chạy nhất tháng 7/2026 là những món nào?"
 Date Anchors: Tháng 7/2026: 2026-07-01 đến 2026-07-31.
-Notes:
-- [Entity & Time analysis]: Top 3 best selling items in July 2026.
-- [Logic & Formulas]: Total quantity base DESC, tie-breaker product_id ASC.
-- [Output Type]: list
 TYPE: list
 ```sql
 SELECT ten_san_pham
-FROM don_hang_chi_tiet
-WHERE TRY_CAST(ngay AS DATE) BETWEEN '2026-07-01' AND '2026-07-31'
-  AND LOWER(trang_thai) NOT IN ('huỷ', 'trả hàng')
+FROM ban_hang
+WHERE ngay_ban BETWEEN DATE '2026-07-01' AND DATE '2026-07-31'
+  AND vn(trang_thai) NOT IN ('huy', 'tra hang')
 GROUP BY ten_san_pham, ma_san_pham
 ORDER BY SUM(so_luong) DESC, ma_san_pham ASC
 LIMIT 3;
@@ -121,9 +109,6 @@ FEW_SHOT_EX4 = """
 Example 4 (Câu không trả lời được - unanswerable):
 Question: "lợi nhuận ròng của cửa hàng trong tháng 5/2026 là bao nhiêu?"
 Date Anchors: Tháng 5/2026: 2026-05-01 đến 2026-05-31.
-Notes:
-- [Entity & Time analysis]: Net profit requested but database lacks expense ledger/cost tables.
-- [Output Type]: unanswerable
 TYPE: unanswerable
 ```sql
 SELECT NULL AS answer;
@@ -258,6 +243,7 @@ class PromptBuilder:
     def build_shop_static_prefix(
         self,
         ctx: BusinessContext,
+        question: str = "",
         canonical_sales_sql: Optional[str] = None,
         canonical_orders_sql: Optional[str] = None,
         canonical_purchases_sql: Optional[str] = None,
@@ -266,33 +252,19 @@ class PromptBuilder:
         """
         USER Part 1 (Shop Static Prefix):
         - README.md
-        - RAW SCHEMA (with sample rows & original->clean column mappings)
-        - CANONICAL VIEWS (v_sales, v_orders) & DEBT MACROS.
-        100% shared across all questions of the same business_id.
+        - PROFILED SCHEMA (unified tables, date ranges, enum frequencies, verified joins)
         """
         readme = ctx.readme_text.strip()
-        if len(readme) > 600:
-            readme = readme[:600] + "\n...[truncated]"
+        if len(readme) > 500:
+            readme = readme[:500] + "\n...[truncated]"
         if not readme:
             readme = "No README provided."
 
-        schema_summary = ctx.get_schema_summary()
-
-        views_section = []
-        if canonical_sales_sql and canonical_orders_sql:
-            views_section.append("Canonical Views Available:")
-            views_section.append("`v_sales`: Standardized order item sales (order_id, order_date, status, is_valid_sales, customer_id, customer_name, product_id, product_name, unit_name, quantity_base, unit_price, line_amount)")
-            views_section.append("`v_orders`: Standardized order headers (order_id, order_date, status, is_cancelled, is_returned, is_valid_sales, customer_id, customer_name, payment_method, order_total)")
-        if canonical_purchases_sql:
-            if not views_section:
-                views_section.append("Canonical Views Available:")
-            views_section.append("`v_purchases`: Standardized purchase items (purchase_id, purchase_date, status, is_valid_purchase, supplier_id, supplier_name, product_id, product_name, unit_name, quantity_base, unit_price, line_amount)")
-        if has_debt_macros:
-            views_section.append("Debt Macros Available:")
-            views_section.append("- `debt_at('YYYY-MM-DD')`: Table macro of remaining debts at given date")
-            views_section.append("- `debt_new('start', 'end')`: Table macro of new debts incurred in period")
-            views_section.append("- `debt_repaid('start', 'end')`: Table macro of debt repayments collected in period")
-        canonical_str = "\n".join(views_section) if views_section else "No canonical views built; query raw tables directly."
+        if getattr(ctx, "profile", None) is not None:
+            from ..data_layer.profiler import render_schema
+            schema_summary = render_schema(ctx.profile, question=question, max_chars=4500)
+        else:
+            schema_summary = ctx.get_schema_summary(question=question)
 
         prefix_parts = [
             "===================================================================",
@@ -302,15 +274,9 @@ class PromptBuilder:
             readme,
             "",
             "===================================================================",
-            "2. DATABASE SCHEMA & SAMPLE DATA",
+            "2. DATABASE SCHEMA (PROFILED & UNIFIED TABLES)",
             "===================================================================",
-            "The DuckDB database contains the following tables:",
             schema_summary,
-            "",
-            "===================================================================",
-            "3. CANONICAL VIEWS & MACROS (IF CONSTRUCTED)",
-            "===================================================================",
-            canonical_str,
         ]
         return "\n".join(prefix_parts)
 
@@ -322,8 +288,8 @@ class PromptBuilder:
         """
         USER Part 2 (Question Dynamic Suffix):
         - DATE ANCHORS (today = as_of_date, resolved windows for tuần này, tuần rồi, tháng này, Tết, etc.)
-        - RULEBOOK CONSTRAINTS
-        - 4 Few-Shot SQL Examples
+        - RULEBOOK CONSTRAINTS & PROFILER HINTS
+        - 2 Curated Few-Shot SQL Examples
         - QUESTION & Vietnamese abbreviations hint.
         """
         date_res = self.date_resolver.resolve(question, as_of_date)
@@ -331,27 +297,30 @@ class PromptBuilder:
 
         suffix_parts = [
             "===================================================================",
-            "4. DATE ANCHORS & TIME WINDOW RESOLUTION",
+            "3. DATE ANCHORS & TIME WINDOW RESOLUTION",
             "===================================================================",
             f"- Today (as_of_date): {as_of_date}",
             "- Target Date Context:",
             date_explanation,
             "",
             "===================================================================",
-            "5. RULEBOOK CONSTRAINTS & HINTS",
+            "4. RULEBOOK CONSTRAINTS & HINTS",
             "===================================================================",
             "- The Business Rulebook provided in the system prompt is the authoritative single source of truth for all metric calculations, status filtering, date definitions, ranking ties, and rounding conventions.",
+            "- Use the exact table and column names shown in SCHEMA. Notice that monthly shard tables have already been merged into a single table!",
+            "- All DATE, BIGINT, and DOUBLE columns are already properly typed—use SUM(), AVG(), and col BETWEEN DATE 'YYYY-MM-DD' AND DATE 'YYYY-MM-DD' directly.",
+            "- For categorical columns with ∈ {val1 (count), val2 (count)}, copy the exact string literal from the enum list, OR use the accent-insensitive macro vn(col) = vn('gia tri') / vn(col) LIKE '%' || vn('tu khoa') || '%'.",
+            "- Use only verified joins listed under QUAN HE JOIN DA KIEM CHUNG.",
             "- If the required columns or tables do not exist in the database to answer the question, output TYPE: unanswerable.",
             "- Ensure all queries are valid DuckDB SQL syntax.",
-            "- When canonical views (`v_sales`, `v_orders`) are available, you may query them; otherwise query raw tables directly.",
             "",
             "===================================================================",
-            "6. FEW-SHOT EXAMPLES (SIMILAR QUESTIONS)",
+            "5. FEW-SHOT EXAMPLES (SIMILAR QUESTIONS)",
             "===================================================================",
             select_curated_few_shots(question),
             "",
             "===================================================================",
-            "7. CURRENT QUESTION & HINTS",
+            "6. CURRENT QUESTION & HINTS",
             "===================================================================",
             f'Question: "{question}"',
             f"As-of Date: {as_of_date}",
@@ -366,7 +335,7 @@ class PromptBuilder:
             "- 'sl' = quantity",
             "- 'km', 'ck' = discount / promotion",
             "",
-            "Please write your reasoning in Notes, then output the target TYPE and the DuckDB SQL query.",
+            "Output ONLY the target TYPE followed by the ```sql ... ``` query block.",
         ]
         return "\n".join(suffix_parts)
 
@@ -385,6 +354,7 @@ class PromptBuilder:
         """
         shop_prefix = self.build_shop_static_prefix(
             ctx=ctx,
+            question=question,
             canonical_sales_sql=canonical_sales_sql,
             canonical_orders_sql=canonical_orders_sql,
             canonical_purchases_sql=canonical_purchases_sql,
@@ -410,7 +380,7 @@ class PromptBuilder:
         """
         Creates OpenAI/vLLM format message list with strict static-to-dynamic prompt hierarchy.
         """
-        sys_prompt = self.build_system_prompt(runtime_rulebook_path)
+        sys_prompt = self.build_system_prompt(runtime_rulebook_path, question=question)
         user_prompt = self.build_user_prompt(
             question=question,
             as_of_date=as_of_date,

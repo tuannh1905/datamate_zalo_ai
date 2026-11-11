@@ -34,8 +34,13 @@ class BusinessContext:
     cached_db_path: Optional[str] = None
     canonical_views: Dict[str, Any] = field(default_factory=dict)
     debt_macros_registered: bool = False
+    profile: Optional[Any] = None
 
-    def get_schema_summary(self) -> str:
+    def get_schema_summary(self, question: str = "") -> str:
+        if self.profile is not None:
+            from .profiler import render_schema
+            return render_schema(self.profile, question=question, max_chars=4500)
+
         lines = []
         for tbl in self.table_names:
             cols = self.schemas.get(tbl, [])
@@ -216,10 +221,20 @@ def parse_vietnamese_number_scalar(val: Any) -> Optional[float]:
         is_neg = True
         s = s[1:].strip()
 
-    # Strip currency and percentage symbols and trailing/leading whitespace
-    s = re.sub(r"(?i)\s*(?:đ|vnd|dong|%)\s*$", "", s).strip()
+    # Strip currency, percentage, and common unit suffixes
+    UNIT_SUFFIXES = r"(?:đ|vnd|dong|%|ly|cái|cai|chai|lon|hộp|hop|kg|g|ml|phần|phan|suất|suat|bịch|bich|gói|goi|thùng|thung|chén|chen|dĩa|dia|bát|bat)"
+    s = re.sub(rf"(?i)\s*{UNIT_SUFFIXES}\s*$", "", s).strip()
     s = re.sub(r"(?i)^(?:đ|vnd|dong)\s*", "", s).strip()
     s = s.replace(" ", "")
+
+    if not s:
+        return None
+
+    # Check for 'k' multiplier suffix e.g. 12k -> 12000
+    is_k_multiplier = False
+    if s.lower().endswith("k"):
+        is_k_multiplier = True
+        s = s[:-1].strip()
 
     if not s:
         return None
@@ -263,6 +278,8 @@ def parse_vietnamese_number_scalar(val: Any) -> Optional[float]:
 
     try:
         f = float(s)
+        if is_k_multiplier:
+            f *= 1000.0
         return -f if is_neg else f
     except Exception:
         return None
@@ -289,7 +306,8 @@ def is_vietnamese_number_string(val: Any) -> bool:
     s = str(val).strip()
     if not s or s.lower() in ("nan", "none", "null", "-", "—"):
         return False
-    cleaned = re.sub(r"(?i)\s*(?:đ|vnd|dong|%)\s*$", "", s).strip()
+    UNIT_SUFFIXES = r"(?:đ|vnd|dong|%|k|ly|cái|cai|chai|lon|hộp|hop|kg|g|ml|phần|phan|suất|suat|bịch|bich|gói|goi|thùng|thung|chén|chen|dĩa|dia|bát|bat)"
+    cleaned = re.sub(rf"(?i)\s*{UNIT_SUFFIXES}\s*$", "", s).strip()
     cleaned = re.sub(r"(?i)^(?:đ|vnd|dong)\s*", "", cleaned).strip()
     cleaned = cleaned.replace(" ", "")
     if not cleaned:
@@ -440,7 +458,7 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]
             for col in df.columns[:6]:
                 col_norm = normalize_identifier(str(col))
                 words = set(col_norm.split("_"))
-                if words & {"gia", "don_gia", "tien", "thanh_tien", "so_luong"}:
+                if any(w in col_norm for w in ["gia", "don_gia", "tien", "thanh_tien", "so_luong"]) or (words & {"gia", "don_gia", "tien", "thanh_tien", "so_luong"}):
                     continue
                 if words & ALLOWED_FFILL_WORDS:
                     group_cols.append(col)
@@ -465,12 +483,15 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]
     # 4. Safe type cleaning for dates and numbers
     DATE_KEYWORDS = {"ngay", "date", "thoi_gian", "ngay_lap", "ngay_ct", "ngay_dat", "ngay_ban", "ngay_tao"}
     IDENTIFIER_KEYWORDS = {"id", "ma", "code", "barcode", "sdt", "phone", "dien_thoai", "ghi_chu", "note", "mo_ta", "ten", "name"}
+    AMOUNT_SUBSTRINGS = ["so_luong", "thanh_tien", "don_gia", "tong_tien", "chiet_khau", "giam_gia", "gia_von", "ton_kho"]
+    AMOUNT_SINGLE_TOKENS = {"gia", "tien", "luong", "no", "phi", "von", "ck", "km", "sl", "dt"}
 
     for col in df.columns:
-        words = set(col.lower().split("_"))
+        col_norm = col.lower()
+        words = set(col_norm.split("_"))
 
         # Check Date column
-        if words & DATE_KEYWORDS:
+        if (words & DATE_KEYWORDS) or any(k in col_norm for k in ["ngay", "thoi_gian"]):
             df[col] = clean_date_series(df[col])
             continue
 
@@ -491,20 +512,24 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]
             df[col] = pd.Series([None] * len(df), dtype="string")
             continue
 
-        # If not an identifier column, check if >70% match Vietnamese number patterns
-        is_ident = bool(words & IDENTIFIER_KEYWORDS)
+        # If not an identifier column, check if matches Vietnamese number patterns
+        is_ident = bool(words & IDENTIFIER_KEYWORDS) or any(col_norm.startswith(p) for p in ["ma_", "id_"])
+        is_amount_col = any(w in col_norm for w in AMOUNT_SUBSTRINGS) or bool(words & AMOUNT_SINGLE_TOKENS)
+
         if not is_ident:
             matching_count = sum(is_vietnamese_number_string(v) for v in orig_series[non_empty_mask])
             ratio = matching_count / num_non_empty
 
-            if ratio >= 0.70:
+            min_ratio = 0.50 if is_amount_col else 0.70
+
+            if ratio >= min_ratio:
                 cleaned = clean_number_series(orig_series)
                 parsed_non_empty = int(cleaned[non_empty_mask].notna().sum())
                 parse_rate = parsed_non_empty / num_non_empty
                 loss_rate = (num_non_empty - parsed_non_empty) / num_non_empty
 
-                if parse_rate >= 0.70 and loss_rate <= 0.30:
-                    # Check if all non-null parsed values are integer-like
+                # Only apply if parsed successfully without destructive loss (loss <= 20%)
+                if parse_rate >= 0.70 and loss_rate <= 0.20:
                     valid_cleaned = cleaned[cleaned.notna()]
                     if len(valid_cleaned) > 0 and (valid_cleaned % 1 == 0).all():
                         df[col] = cleaned.astype("Int64")
@@ -517,6 +542,33 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]
             df[col] = pd.Series([None] * len(df), dtype="string")
 
     return df, col_mapping
+
+
+def configure_duckdb_connection(con: duckdb.DuckDBPyConnection) -> None:
+    """Applies memory limits and thread configurations to DuckDB connection."""
+    config_candidates = [
+        os.path.join(os.path.dirname(__file__), "..", "..", "configs", "config.yaml"),
+        "configs/config.yaml",
+    ]
+    memory_limit = "4GB"
+    threads = 4
+    for p in config_candidates:
+        if os.path.exists(p):
+            try:
+                import yaml
+                with open(p, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f)
+                exec_cfg = cfg.get("execution", {})
+                memory_limit = exec_cfg.get("memory_limit", "4GB")
+                threads = exec_cfg.get("threads", 4)
+                break
+            except Exception:
+                pass
+    try:
+        con.execute(f"SET memory_limit='{memory_limit}';")
+        con.execute(f"SET threads={threads};")
+    except Exception as e:
+        logger.debug(f"Could not apply DuckDB resource limits: {e}")
 
 
 def get_duckdb_cache_dir(cache_dir: Optional[str] = None) -> str:
@@ -593,17 +645,15 @@ def load_business_data(
             with open(meta_cache_path, "r", encoding="utf-8") as f_meta:
                 meta = json.load(f_meta)
 
-            # Check if source business_dir matches and files haven't been modified
-            cached_dir = meta.get("business_dir", "")
-            cached_views = meta.get("canonical_views", {})
-            has_valid_views = bool(cached_views and cached_views.get("v_sales_sql"))
-
             con = duckdb.connect(database=db_cache_path, read_only=True)
+            configure_duckdb_connection(con)
             cached_tables = [r[0] for r in con.execute("SHOW TABLES").fetchall()]
 
-            if (has_valid_views and "v_sales" in cached_tables and "v_orders" in cached_tables) or meta.get("ingested_successfully"):
+            if meta.get("ingested_successfully") and cached_tables:
                 logger.info(f"Loaded cached DuckDB for business '{business_id}' (read_only=True): {db_cache_path}")
-                return BusinessContext(
+                from .profiler import install_macros, build_profile
+                install_macros(con)
+                ctx = BusinessContext(
                     business_id=business_id,
                     business_dir=business_dir,
                     con=con,
@@ -613,9 +663,11 @@ def load_business_data(
                     column_mappings=meta.get("column_mappings", {}),
                     is_cached=True,
                     cached_db_path=db_cache_path,
-                    canonical_views=cached_views,
-                    debt_macros_registered=meta.get("debt_macros_registered", False),
                 )
+                ctx.profile = build_profile(ctx)
+                if ctx.profile:
+                    ctx.profile.merged_groups = meta.get("merged_groups", {})
+                return ctx
             else:
                 con.close()
         except Exception as e:
@@ -631,9 +683,11 @@ def load_business_data(
 
     try:
         con = duckdb.connect(database=db_cache_path, read_only=False)
+        configure_duckdb_connection(con)
     except Exception as e:
         logger.warning(f"Could not open file-backed DuckDB '{db_cache_path}' ({e}), using :memory:")
         con = duckdb.connect(database=":memory:")
+        configure_duckdb_connection(con)
         db_cache_path = None
 
     table_names = []
@@ -692,7 +746,10 @@ def load_business_data(
             fpath = os.path.join(business_dir, fname)
             tbl_base = normalize_identifier(os.path.splitext(fname)[0])
             try:
-                excel_file = pd.ExcelFile(fpath, engine="openpyxl")
+                try:
+                    excel_file = pd.ExcelFile(fpath, engine="calamine")
+                except Exception:
+                    excel_file = pd.ExcelFile(fpath, engine="openpyxl")
                 sheet_names = excel_file.sheet_names
 
                 sheet_dfs = []
@@ -853,35 +910,23 @@ def load_business_data(
         cached_db_path=db_cache_path,
     )
 
-    # 3. Auto-build Canonical Views & Debt Macros into File-Backed DB and Cache Metadata
-    if auto_build_views and db_cache_path is not None:
+    # 3. Content-Driven Profiling & Safe Shard Unioning
+    from .profiler import prepare, install_macros, build_profile
+    ctx.profile = prepare(ctx)
+
+    if db_cache_path is not None:
         try:
-            from .view_builder import build_canonical_views
-            from .debt_macros import register_debt_macros
-
-            view_res = build_canonical_views(ctx, k=8)
-            debt_status = register_debt_macros(ctx, plausibility_check=True)
-
-            views_dict = {
-                "success": view_res.success,
-                "v_sales_sql": view_res.v_sales_sql,
-                "v_orders_sql": view_res.v_orders_sql,
-                "v_purchases_sql": view_res.v_purchases_sql,
-            }
-            ctx.canonical_views = views_dict
-            ctx.debt_macros_registered = debt_status.registered
-
             # Save metadata json
+            merged_groups_dict = ctx.profile.merged_groups if ctx.profile else {}
             meta_data = {
                 "business_id": business_id,
                 "business_dir": business_dir,
                 "ingested_successfully": True,
-                "table_names": table_names,
+                "table_names": ctx.table_names,
                 "schemas": schemas,
                 "readme_text": readme_text,
                 "column_mappings": all_col_mappings,
-                "canonical_views": views_dict,
-                "debt_macros_registered": debt_status.registered,
+                "merged_groups": merged_groups_dict,
             }
             with open(meta_cache_path, "w", encoding="utf-8") as f_meta:
                 json.dump(meta_data, f_meta, ensure_ascii=False, indent=2)
@@ -890,7 +935,12 @@ def load_business_data(
             try:
                 con.close()
                 con_ro = duckdb.connect(database=db_cache_path, read_only=True)
+                configure_duckdb_connection(con_ro)
+                install_macros(con_ro)
                 ctx.con = con_ro
+                ctx.profile = build_profile(ctx)
+                if ctx.profile:
+                    ctx.profile.merged_groups = merged_groups_dict
                 ctx.is_cached = True
             except Exception as ro_err:
                 logger.warning(f"Could not reopen DuckDB in read_only mode ({ro_err}); keeping open connection.")

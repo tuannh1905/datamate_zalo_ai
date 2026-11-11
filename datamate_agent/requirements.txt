@@ -1,6 +1,7 @@
 # DataMate Agent Dependencies
 duckdb>=1.0.0
 openpyxl>=3.1.2
+python-calamine>=0.2.0
 pandas>=2.0.0
 numpy>=1.24.0
 pyyaml>=6.0

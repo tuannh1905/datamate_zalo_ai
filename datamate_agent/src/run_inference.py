@@ -19,9 +19,7 @@ import yaml
 
 from .context.prompt_builder import PromptBuilder, build_chat_prompt
 from .data_layer.dataset_loader import group_questions_by_business, load_questions
-from .data_layer.debt_macros import register_debt_macros
 from .data_layer.ingest import BusinessContext, load_business_data, resolve_business_dir
-from .data_layer.view_builder import build_canonical_views
 from .inference.executor_voter import CandidateExecution, ExecutorVoter, QuestionInferenceResult
 from .inference.llm_engine import LLMEngine
 from .inference.verifier import verify_candidate_execution
@@ -173,26 +171,17 @@ def run_inference_pipeline(
         logger.info(f"--- Loading Business [{b_id}] ({len(q_list)} queries) ---")
         ctx = load_business_data(b_id, b_dir, cache_dir=cache_dir)
 
-        # Build / retrieve canonical views and debt macros
-        view_res = build_canonical_views(ctx, k=8)
-        debt_status = register_debt_macros(ctx, plausibility_check=True)
-
         voter = ExecutorVoter(
             con=ctx.con,
             llm_engine=llm_engine,
             agreement_threshold_tau=tau,
             sql_timeout_seconds=sql_timeout,
             schema_summary=ctx.get_schema_summary(),
+            ctx=ctx,
         )
 
         # Build Shop Static Prefix (100% shared across all questions of this shop)
-        shop_prefix = prompt_builder.build_shop_static_prefix(
-            ctx=ctx,
-            canonical_sales_sql=view_res.v_sales_sql if view_res.success else None,
-            canonical_orders_sql=view_res.v_orders_sql if view_res.success else None,
-            canonical_purchases_sql=view_res.v_purchases_sql if view_res.success else None,
-            has_debt_macros=debt_status.registered,
-        )
+        shop_prefix = prompt_builder.build_shop_static_prefix(ctx=ctx)
         sys_prompt = prompt_builder.build_system_prompt(rulebook_path)
 
         for q in q_list:
@@ -212,20 +201,55 @@ def run_inference_pipeline(
             full_prompt = build_chat_prompt(
                 tokenizer=llm_engine.tokenizer,
                 messages=messages,
-                prefill="Notes:\n-",
+                prefill="TYPE: ",
             )
 
             # Generate initial plain samples (k_samples, default 8) via single batch call
-            initial_outputs = llm_engine.generate_samples(
-                prompts=[full_prompt],
-                n=k_samples,
-                temperature=0.7 if k_samples > 1 else 0.0,
-                max_tokens=512,
-            )[0]
+            try:
+                initial_outputs = llm_engine.generate_samples(
+                    prompts=[full_prompt],
+                    n=k_samples,
+                    temperature=0.7 if k_samples > 1 else 0.0,
+                    max_tokens=512,
+                )[0]
+            except Exception as gen_err:
+                is_oom = "OutOfMemoryError" in type(gen_err).__name__ or "CUDA out of memory" in str(gen_err)
+                if is_oom:
+                    logger.error(f"[CUDA OOM Guard] Out of memory on question {q_id}: {gen_err}")
+                    import gc
+                    gc.collect()
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    res = QuestionInferenceResult(
+                        question_id=q_id,
+                        business_id=b_id,
+                        final_type="abstain",
+                        final_answer=None,
+                        confidence=0.0,
+                        total_samples=0,
+                        agreement_count=0,
+                        elapsed_time=time.time() - q_start_time,
+                        reason="oom_error",
+                    )
+                    results_by_id[q_id] = res
+                    total_abstain += 1
+                    total_processed += 1
+                    log_path = os.path.join(log_dir, f"{q_id}.json")
+                    log_data = res.to_log_dict()
+                    log_data["error"] = "oom_error"
+                    with open(log_path, "w", encoding="utf-8") as f_log:
+                        json.dump(log_data, f_log, ensure_ascii=False, indent=2)
+                    continue
+                else:
+                    raise gen_err
 
             candidates: List[CandidateExecution] = []
             for idx, comp in enumerate(initial_outputs):
-                full_comp = comp if comp.startswith("Notes:\n-") else ("Notes:\n-" + comp)
+                full_comp = comp if comp.strip().startswith("TYPE:") else ("TYPE: " + comp.strip())
                 cand = voter.process_candidate(
                     sample_id=idx,
                     raw_completion=full_comp,
@@ -257,7 +281,7 @@ def run_inference_pipeline(
                 thinking_prompt = build_chat_prompt(
                     tokenizer=llm_engine.tokenizer,
                     messages=thinking_messages,
-                    prefill="Notes:\n-",
+                    prefill="TYPE: ",
                 )
                 thinking_outputs = llm_engine.generate_samples(
                     prompts=[thinking_prompt],
@@ -267,7 +291,7 @@ def run_inference_pipeline(
                 )[0]
 
                 for idx, comp in enumerate(thinking_outputs):
-                    full_comp = comp if comp.startswith("Notes:\n-") else ("Notes:\n-" + comp)
+                    full_comp = comp if comp.strip().startswith("TYPE:") else ("TYPE: " + comp.strip())
                     cand = voter.process_candidate(
                         sample_id=k_samples + idx,
                         raw_completion=full_comp,
