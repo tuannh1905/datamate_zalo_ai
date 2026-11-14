@@ -14,7 +14,6 @@ pip install duckdb openpyxl pandas numpy pyyaml pydantic tqdm python-dateutil py
 pip install "huggingface-hub>=1.5.0,<2.0"
 pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git" || echo "Notice: Unsloth install failed, falling back to standard PEFT."
 pip install peft accelerate bitsandbytes datasets
-pip install -q xformers || echo "Notice: xformers install skipped"
 
 # Optional vLLM installation: only if INSTALL_VLLM=1 is explicitly requested
 if [ "${INSTALL_VLLM}" = "1" ]; then

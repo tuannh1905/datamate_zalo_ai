@@ -41,10 +41,14 @@ def main():
     parser.add_argument("--adapter", default=None, help="Adapter path override")
     parser.add_argument("--config", default=None, help="Path to config.yaml")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of questions for quick testing")
-    parser.add_argument("--k", type=int, default=None, help="Number of samples per question (defaults to config: 8)")
+    parser.add_argument("--k", type=int, default=None, help="Number of samples per question (defaults to config: 1)")
     parser.add_argument("--verbose", action="store_true", help="Print details on incorrect answers")
     
     args = parser.parse_args()
+
+    # Resolve default config path if not provided
+    default_cfg = os.path.abspath(os.path.join(os.path.dirname(__file__), "../configs/config.yaml"))
+    config_path = args.config or (default_cfg if os.path.exists(default_cfg) else None)
 
     if args.list_datasets:
         from src.data_layer.dataset_registry import list_datasets
@@ -83,7 +87,7 @@ def main():
                 calendar_path=dataset_paths.calendar_path,
                 submission_path=submission_path,
                 log_dir=log_dir,
-                config_path=args.config,
+                config_path=config_path,
                 model_override=args.model,
                 adapter_override=args.adapter,
                 limit=args.limit,

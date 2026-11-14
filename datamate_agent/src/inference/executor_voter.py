@@ -473,6 +473,7 @@ class ExecutorVoter:
         raw_completion: str,
         orig_question: str,
         is_thinking: bool = False,
+        max_repairs: Optional[int] = None,
     ) -> CandidateExecution:
         """
         Parses, executes, and self-repairs a candidate sample.
@@ -525,8 +526,9 @@ class ExecutorVoter:
         rows = None
         col_names = []
         repair_count = 0
+        repairs_limit = self.max_repairs if max_repairs is None else max_repairs
 
-        for turn in range(self.max_repairs + 1):
+        for turn in range(repairs_limit + 1):
             ok, res_rows, err, cols = self.execute_single_sql(current_sql, pred_type)
             if ok:
                 norm_val, v_key = canonicalize_for_voting(pred_type, res_rows)
@@ -539,7 +541,7 @@ class ExecutorVoter:
                 else:
                     last_error = f"Query executed successfully but returned NULL or empty output for TYPE '{pred_type}'"
                     failure_cat = "EMPTY_RESULT"
-                    if turn < self.max_repairs:
+                    if turn < repairs_limit:
                         rep = self.repair_sql_turn(current_sql, last_error, orig_question)
                         if rep:
                             current_sql = rep
@@ -549,7 +551,7 @@ class ExecutorVoter:
             else:
                 last_error = err
                 failure_cat = "SQL_EXECUTION_ERROR"
-                if turn < self.max_repairs:
+                if turn < repairs_limit:
                     rep = self.repair_sql_turn(current_sql, err, orig_question)
                     if rep:
                         current_sql = rep

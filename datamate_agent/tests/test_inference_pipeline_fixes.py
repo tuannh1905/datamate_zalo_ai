@@ -262,3 +262,28 @@ def test_excel_serial_date_parsing():
     assert cleaned.iloc[1] == "2025-06-01"
     assert cleaned.iloc[2] == "2025-06-07"
     assert cleaned.iloc[3] == "2026-08-15"
+
+
+# 12. Test is_model_large and max_repairs support
+def test_is_model_large_detection():
+    from src.inference.llm_engine import is_model_large
+    assert is_model_large("Qwen/Qwen2.5-Coder-7B-Instruct") is True
+    assert is_model_large("./weights/base_model_7b") is True
+    assert is_model_large("Qwen/Qwen2.5-Coder-3B-Instruct") is False
+    assert is_model_large("") is False
+
+
+def test_process_candidate_max_repairs_override():
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (x INT); INSERT INTO t VALUES (42);")
+    engine = LLMEngine(model_name_or_path="mock", allow_mock=True)
+    voter = ExecutorVoter(con=con, llm_engine=engine, max_repair_turns=2)
+    # A candidate with broken SQL and max_repairs=0 should NOT attempt repair
+    cand = voter.process_candidate(
+        sample_id=0,
+        raw_completion="TYPE: number\n```sql\nSELECT bad_col FROM t;\n```",
+        orig_question="x là bao nhiêu?",
+        max_repairs=0,
+    )
+    assert cand.success is False
+    assert cand.repair_turns == 0

@@ -23,24 +23,25 @@ paths:
 model:
   base_model_name_or_path: "Qwen/Qwen2.5-Coder-3B-Instruct"
   adapter_path: null  # Set to adapter directory if loaded
-  quantization: "none"  # none | 4bit | fp8 (none uses fast native fp16 on T4)
-  load_in_4bit: false
+  quantization: "4bit"  # 4bit (NF4 BitsAndBytes for safe VRAM) | none | fp8
+  load_in_4bit: true
   load_in_8bit: false
   dtype: "float16"
   tensor_parallel_size: 1
-  gpu_memory_utilization: 0.90
-  max_model_len: 16384
+  gpu_memory_utilization: 0.85
+  max_model_len: 8192
   trust_remote_code: true
 
 inference:
-  # Sampling parameters for plain samples (n=8 parallel batch sampling)
-  num_samples_k: 8
-  temperature: 0.7
+  # Sampling parameters: Deterministic 1-pass greedy execution (k=1, temp=0.0)
+  num_samples_k: 1
+  temperature: 0.0
   top_p: 0.95
   max_new_tokens: 512
+  early_exit: true
   
-  # Thinking / Deep reasoning samples (+4 on low agreement < 0.5)
-  num_thinking_samples: 4
+  # Thinking / Deep reasoning samples (0 = disabled for high speed and consistent PA)
+  num_thinking_samples: 0
   thinking_temperature: 0.6
   thinking_max_new_tokens: 1024
   
@@ -50,7 +51,7 @@ inference:
 
 execution:
   sql_timeout_seconds: 5.0
-  max_repair_turns: 2
+  max_repair_turns: 1
   max_rows_output: 100
   memory_limit: "4GB"
   threads: 4

@@ -52,8 +52,8 @@ def run_inference_pipeline(
     inf_cfg = config.get("inference", {})
     exec_cfg = config.get("execution", {})
 
-    k_samples = k_override if k_override is not None else inf_cfg.get("num_samples_k", 8)
-    thinking_k = inf_cfg.get("num_thinking_samples", 4)
+    k_samples = k_override if k_override is not None else inf_cfg.get("num_samples_k", 1)
+    thinking_k = inf_cfg.get("num_thinking_samples", 0)
     tau = inf_cfg.get("agreement_threshold_tau", 0.5)
     sql_timeout = exec_cfg.get("sql_timeout_seconds", 5.0)
 
@@ -118,6 +118,11 @@ def run_inference_pipeline(
     llm_engine = LLMEngine(
         model_name_or_path=model_path,
         adapter_path=adapter_path,
+        tensor_parallel_size=model_cfg.get("tensor_parallel_size", 1),
+        gpu_memory_utilization=model_cfg.get("gpu_memory_utilization", 0.85),
+        max_model_len=model_cfg.get("max_model_len", 8192),
+        quantization=model_cfg.get("quantization", "4bit"),
+        trust_remote_code=model_cfg.get("trust_remote_code", True),
         allow_mock=allow_mock,
     )
 
@@ -204,16 +209,16 @@ def run_inference_pipeline(
                 prefill="TYPE: ",
             )
 
-            # Generate initial plain samples (k_samples, default 8) via single batch call
+            # Tier 1: Generate initial greedy sample (deterministic temp=0.0)
             try:
-                initial_outputs = llm_engine.generate_samples(
+                tier1_outputs = llm_engine.generate_samples(
                     prompts=[full_prompt],
-                    n=k_samples,
-                    temperature=0.7 if k_samples > 1 else 0.0,
+                    n=1,
+                    temperature=0.0,
                     max_tokens=512,
                 )[0]
             except Exception as gen_err:
-                is_oom = "OutOfMemoryError" in type(gen_err).__name__ or "CUDA out of memory" in str(gen_err)
+                is_oom = "OutOfMemoryError" in type(gen_err).__name__ or "CUDA out of memory" in str(gen_err) or "CUDA_OOM" in str(gen_err)
                 if is_oom:
                     logger.error(f"[CUDA OOM Guard] Out of memory on question {q_id}: {gen_err}")
                     import gc
@@ -247,27 +252,88 @@ def run_inference_pipeline(
                 else:
                     raise gen_err
 
-            candidates: List[CandidateExecution] = []
-            for idx, comp in enumerate(initial_outputs):
-                full_comp = comp if comp.strip().startswith("TYPE:") else ("TYPE: " + comp.strip())
-                cand = voter.process_candidate(
-                    sample_id=idx,
-                    raw_completion=full_comp,
-                    orig_question=q_text,
-                    is_thinking=False,
-                )
-                candidates.append(cand)
+            comp = tier1_outputs[0] if tier1_outputs else ""
+            full_comp = comp if comp.strip().startswith("TYPE:") else ("TYPE: " + comp.strip())
+            cand = voter.process_candidate(
+                sample_id=0,
+                raw_completion=full_comp,
+                orig_question=q_text,
+                is_thinking=False,
+                max_repairs=exec_cfg.get("max_repair_turns", 1),
+            )
+            candidates: List[CandidateExecution] = [cand]
 
-            # Check intermediate top agreement
+            is_valid, conf_score, fail_reason = verify_candidate_execution(cand, q_text, as_of_date)
+            early_exit_enabled = inf_cfg.get("early_exit", True)
+
+            # Fast Path: If greedy candidate succeeded and verified cleanly, exit immediately
+            if early_exit_enabled and is_valid and cand.success:
+                q_elapsed = time.time() - q_start_time
+                result = QuestionInferenceResult(
+                    question_id=q_id,
+                    business_id=b_id,
+                    final_type=cand.parsed_type,
+                    final_answer=cand.normalized_value,
+                    confidence=conf_score,
+                    total_samples=1,
+                    agreement_count=1,
+                    elapsed_time=q_elapsed,
+                    vote_distribution={cand.vote_key or cand.parsed_type: 1},
+                    candidates=candidates,
+                )
+                results_by_id[q_id] = result
+                if result.final_type == "abstain":
+                    total_abstain += 1
+                total_processed += 1
+
+                log_data = result.to_log_dict()
+                log_data.update({
+                    "question": q_text,
+                    "as_of_date": as_of_date,
+                    "model_name": model_path,
+                    "adapter_name": adapter_path or "None",
+                    "resolved_business_dir": b_dir,
+                    "k_samples": 1,
+                    "early_exit": True,
+                })
+                log_path = os.path.join(log_dir, f"{q_id}.json")
+                with open(log_path, "w", encoding="utf-8") as f_log:
+                    json.dump(log_data, f_log, ensure_ascii=False, indent=2)
+                continue
+
+            # Fallback Path: If k_samples > 1 and Tier 1 was not confident/failed
+            if k_samples > 1:
+                remaining_k = k_samples - 1
+                try:
+                    more_outputs = llm_engine.generate_samples(
+                        prompts=[full_prompt],
+                        n=remaining_k,
+                        temperature=0.7,
+                        max_tokens=512,
+                    )[0]
+                    for idx, m_comp in enumerate(more_outputs):
+                        m_full = m_comp if m_comp.strip().startswith("TYPE:") else ("TYPE: " + m_comp.strip())
+                        m_cand = voter.process_candidate(
+                            sample_id=1 + idx,
+                            raw_completion=m_full,
+                            orig_question=q_text,
+                            is_thinking=False,
+                            max_repairs=0,  # Do not run repair loops on secondary samples
+                        )
+                        candidates.append(m_cand)
+                except Exception as gen_err:
+                    logger.warning(f"Secondary sampling error on {q_id}: {gen_err}")
+
+            # Check intermediate top agreement if multiple candidates exist
             valid_candidates = [c for c in candidates if c.success and c.vote_key is not None]
             group_counts = Counter((c.parsed_type, c.vote_key) for c in valid_candidates)
             top_count = group_counts.most_common(1)[0][1] if group_counts else 0
-            initial_share = top_count / k_samples
+            initial_share = top_count / max(1, len(candidates))
 
-            # Trigger +4 thinking samples if agreement < tau and thinking_k is configured
+            # Trigger thinking samples only if k_samples >= 4 and agreement < tau and thinking_k > 0
             if k_samples >= 4 and initial_share < tau and thinking_k > 0:
                 logger.info(
-                    f"Question [{q_id}]: Initial agreement {top_count}/{k_samples} ({initial_share:.2f}) < tau={tau}. "
+                    f"Question [{q_id}]: Initial agreement {top_count}/{len(candidates)} ({initial_share:.2f}) < tau={tau}. "
                     f"Triggering +{thinking_k} thinking samples..."
                 )
                 thinking_user_prompt = (
@@ -293,10 +359,11 @@ def run_inference_pipeline(
                 for idx, comp in enumerate(thinking_outputs):
                     full_comp = comp if comp.strip().startswith("TYPE:") else ("TYPE: " + comp.strip())
                     cand = voter.process_candidate(
-                        sample_id=k_samples + idx,
+                        sample_id=len(candidates),
                         raw_completion=full_comp,
                         orig_question=q_text,
                         is_thinking=True,
+                        max_repairs=0,
                     )
                     candidates.append(cand)
 
@@ -323,7 +390,7 @@ def run_inference_pipeline(
                 "model_name": model_path,
                 "adapter_name": adapter_path or "None",
                 "resolved_business_dir": b_dir,
-                "k_samples": k_samples,
+                "k_samples": len(candidates),
                 "tau": tau,
             })
             log_path = os.path.join(log_dir, f"{q_id}.json")
@@ -331,6 +398,21 @@ def run_inference_pipeline(
                 json.dump(log_data, f_log, ensure_ascii=False, indent=2)
 
             total_processed += 1
+
+        # Close DuckDB connection and free resources after each business
+        if hasattr(ctx, "con") and ctx.con:
+            try:
+                ctx.con.close()
+            except Exception:
+                pass
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     # 6. Write final submission.jsonl in EXACT original question order
     logger.info(f"Writing final submission.jsonl preserving original question order to: {submission_path}")

@@ -7,8 +7,10 @@ and CPU mock mode.
 """
 
 import gc
+import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Set PyTorch allocation conf to avoid VRAM fragmentation and virtual memory mapping errors on Colab T4/L4
@@ -23,6 +25,42 @@ try:
 except ImportError:
     torch = None
     HAS_CUDA = False
+
+
+def is_model_large(model_name_or_path: str) -> bool:
+    """
+    Detects if model is >= 7B parameters by checking:
+    1. Substring "7b", "14b", "32b", "70b" in model path
+    2. Local config.json hidden_size >= 3584 or num_hidden_layers >= 28
+    3. Total size of weights (*.safetensors, *.bin) > 4.5 GB
+    """
+    if not model_name_or_path:
+        return False
+    path_lower = str(model_name_or_path).lower()
+    if any(tag in path_lower for tag in ["7b", "14b", "32b", "70b", "72b"]):
+        return True
+    if os.path.isdir(model_name_or_path):
+        cfg_file = os.path.join(model_name_or_path, "config.json")
+        if os.path.exists(cfg_file):
+            try:
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    cfg_data = json.load(f)
+                hidden_size = cfg_data.get("hidden_size", 0)
+                if hidden_size >= 3584:
+                    return True
+            except Exception:
+                pass
+        try:
+            total_bytes = sum(
+                os.path.getsize(os.path.join(model_name_or_path, f))
+                for f in os.listdir(model_name_or_path)
+                if f.endswith((".safetensors", ".bin"))
+            )
+            if total_bytes > 4.5 * (1024 ** 3):
+                return True
+        except Exception:
+            pass
+    return False
 
 # Check if vLLM is available
 HAS_VLLM = False
@@ -83,11 +121,11 @@ class LLMEngine:
 
         # Safe prompt context limit for HuggingFace Transformers
         if self.is_low_vram:
-            self.hf_max_prompt_tokens = 3584
+            self.hf_max_prompt_tokens = 5120
         elif self.vram_gb >= 18.0:
-            self.hf_max_prompt_tokens = 7168
+            self.hf_max_prompt_tokens = 8192
         else:
-            self.hf_max_prompt_tokens = 4096
+            self.hf_max_prompt_tokens = 5120
 
         # 1. Try vLLM if available
         if HAS_VLLM and (os.path.exists(model_name_or_path) or "/" in model_name_or_path):
@@ -168,11 +206,15 @@ class LLMEngine:
 
                 loaded_successfully = False
                 quant_used = "None"
-                want_4bit = (quantization or "").lower() in ("4bit", "bitsandbytes")
-                want_native = (quantization or "").lower() in ("none", "fp16", "half") or (quantization is None and "3b" in model_name_or_path.lower())
+                is_large = is_model_large(model_name_or_path)
+                want_4bit = (
+                    (quantization or "").lower() in ("4bit", "bitsandbytes")
+                    or self.is_low_vram
+                    or is_large
+                )
 
-                if not want_native and (want_4bit or (self.is_low_vram and "7b" in model_name_or_path.lower())):
-                    # Try 4-bit quantization (BitsAndBytes)
+                if want_4bit:
+                    # Try 4-bit quantization (BitsAndBytes NF4)
                     try:
                         from transformers import BitsAndBytesConfig
                         bnb_config = BitsAndBytesConfig(
@@ -189,7 +231,10 @@ class LLMEngine:
                         )
                         loaded_successfully = True
                         quant_used = "BitsAndBytes NF4 (4-bit)"
-                        logger.info("Successfully loaded model with BitsAndBytes 4-bit (NF4) quantization.")
+                        logger.info(
+                            f"Successfully loaded model with BitsAndBytes 4-bit (NF4) quantization "
+                            f"(is_large={is_large}, is_low_vram={self.is_low_vram})."
+                        )
                     except Exception as bnb_err:
                         logger.warning(f"BitsAndBytes 4-bit load failed or unavailable ({bnb_err}). Falling back to native precision...")
 
@@ -241,19 +286,25 @@ class LLMEngine:
     def _prepare_inputs(self, prompt: str, max_tokens: Optional[int] = None) -> Tuple[Dict[str, Any], int]:
         """
         Tokenizes on CPU and safely windows the prompt to avoid quadratic attention OOM on 16GB GPUs.
-        If prompt length exceeds target_max, preserves the tail tokens so Database Schema & Question
-        are NEVER dropped from the context.
+        Preserves head (System Prompt & Rulebook) and tail (Schema & Question).
         """
-        target_max = max_tokens or getattr(self, "hf_max_prompt_tokens", 4096)
+        target_max = max_tokens or getattr(self, "hf_max_prompt_tokens", 5120)
         inputs = self.hf_tokenizer(prompt, return_tensors="pt")
         total_tokens = inputs["input_ids"].shape[1]
         if total_tokens > target_max:
-            logger.info(
+            head_tokens = 512
+            tail_tokens = target_max - head_tokens
+            logger.warning(
                 f"[VRAM Guard] Prompt length ({total_tokens} tokens) exceeds safe threshold ({target_max} tokens). "
-                f"Preserving tail {target_max} tokens (Database Schema & Question kept intact)."
+                f"Windowing prompt: Preserving head {head_tokens} tokens (System rules & Rulebook) + "
+                f"tail {tail_tokens} tokens (Database Schema & Question)."
             )
-            input_ids = inputs["input_ids"][:, -target_max:]
-            attention_mask = inputs["attention_mask"][:, -target_max:]
+            head_ids = inputs["input_ids"][:, :head_tokens]
+            head_mask = inputs["attention_mask"][:, :head_tokens]
+            tail_ids = inputs["input_ids"][:, -tail_tokens:]
+            tail_mask = inputs["attention_mask"][:, -tail_tokens:]
+            input_ids = torch.cat([head_ids, tail_ids], dim=1)
+            attention_mask = torch.cat([head_mask, tail_mask], dim=1)
             del inputs
             inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
             total_tokens = target_max
@@ -265,8 +316,8 @@ class LLMEngine:
     def generate_samples(
         self,
         prompts: Union[str, List[str]],
-        n: int = 8,
-        temperature: float = 0.7,
+        n: int = 1,
+        temperature: float = 0.0,
         max_tokens: int = 512,
         stop: Optional[List[str]] = None,
     ) -> List[List[str]]:
@@ -302,7 +353,7 @@ class LLMEngine:
         if self.is_hf_gpu and self.hf_model is not None and self.hf_tokenizer is not None:
             all_results = []
             do_sample = temperature > 0.0
-            max_seq = getattr(self, "hf_max_prompt_tokens", 4096)
+            max_seq = getattr(self, "hf_max_prompt_tokens", 5120)
 
             # Stopping criteria to halt generation immediately when SQL block finishes
             stopping_criteria_cls = None
@@ -314,7 +365,7 @@ class LLMEngine:
                         super().__init__()
                         self.tokenizer = tokenizer
                         self.prompt_length = prompt_length
-                        self.stop_patterns = ["```\n", "```\r\n", "``` "]
+                        self.stop_patterns = ["```\n", "```\r\n", "``` ", "```"]
 
                     def __call__(self, input_ids: Any, scores: Any, **kwargs) -> bool:
                         new_ids = input_ids[0, self.prompt_length:]
@@ -349,30 +400,34 @@ class LLMEngine:
                         except Exception:
                             pass
 
+                    t_gen_start = time.time()
                     try:
                         with torch.inference_mode():
                             gen_tokens = self.hf_model.generate(**inputs, **gen_kwargs)
+                        gen_len = gen_tokens.shape[1] - prompt_len
+                        gen_sec = max(0.001, time.time() - t_gen_start)
+                        tok_s = gen_len / gen_sec
+                        peak_gib = (torch.cuda.max_memory_allocated() / (1024**3)) if (HAS_CUDA and torch.cuda.is_available()) else 0.0
+                        logger.info(f"[HF gen] Sample {sample_idx+1}/{n}: {gen_len} tokens in {gen_sec:.2f}s ({tok_s:.1f} tok/s, peak {peak_gib:.2f} GiB)")
                         out_text = self.hf_tokenizer.decode(gen_tokens[0][prompt_len:], skip_special_tokens=True)
                         prompt_samples.append(out_text)
                         del gen_tokens
                     except torch.cuda.OutOfMemoryError as oom_err:
-                        logger.warning(
+                        logger.error(
                             f"[CUDA OOM Guard] OOM during sample {sample_idx+1}/{n}: {oom_err}. "
-                            f"Flushing GPU cache and generating emergency fallback."
+                            f"Flushing GPU cache."
                         )
                         gc.collect()
-                        if HAS_CUDA and torch is not None:
+                        if HAS_CUDA and torch is not None and torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                        fallback_completion = (
-                            "TYPE: unanswerable\n"
-                            "```sql\n"
-                            "SELECT NULL AS answer;\n"
-                            "```"
-                        )
-                        prompt_samples.append(fallback_completion)
+                        raise oom_err
 
                 del inputs
+                if HAS_CUDA and torch is not None and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 all_results.append(prompt_samples)
+
+            return all_results
 
             return all_results
 

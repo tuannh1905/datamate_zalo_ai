@@ -279,18 +279,20 @@ Tổng cộng;;;;450.000 đ
 
 def main():
     parser = argparse.ArgumentParser(description="DataMate Agent End-to-End Smoke Test.")
-    parser.add_argument("--mock_llm", action="store_true", default=True, help="Use mock LLM responses for quick local verification")
-    parser.add_argument("--limit", type=int, default=2, help="Number of test questions to process")
+    parser.add_argument("--real_llm", action="store_true", default=False, help="Run inference with real offline LLM on GPU")
+    parser.add_argument("--limit", type=int, default=5, help="Number of test questions to process (default: 5)")
     args = parser.parse_args()
 
+    use_mock = not args.real_llm
     start_time = time.time()
     print("=" * 65)
     print("      DATAMATE AGENT - END-TO-END VERIFICATION SMOKE TEST")
+    print(f"      Mode: {'MOCK LLM' if use_mock else 'REAL GPU LLM'} | Limit: {args.limit}")
     print("=" * 65)
 
     test_evaluator_all_9_types()
     test_date_resolver_vietnamese()
-    test_end_to_end_pipeline(mock_llm=args.mock_llm, limit=args.limit)
+    test_end_to_end_pipeline(mock_llm=use_mock, limit=args.limit)
 
     total_time = time.time() - start_time
     print("=" * 65)
